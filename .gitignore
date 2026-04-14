@@ -1,0 +1,27 @@
+# Binaries and tools
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test artifacts
+cover.out
+*.test
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+
+# Taskfile / test infrastructure
+.task/
+.test-infra/
+
+# Local env
+.env
