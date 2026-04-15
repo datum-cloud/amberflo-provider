@@ -62,9 +62,10 @@ var (
 
 	// fakeHTTP is the in-process httptest-backed Amberflo stand-in. The
 	// controller's Amberflo client is wired to this server's URL.
-	fakeHTTP       *recordingFakeServer
-	amberfloClient amberflo.Client
-	reconciler     *BillingAccountReconciler
+	fakeHTTP        *recordingFakeServer
+	amberfloClient  amberflo.Client
+	reconciler      *BillingAccountReconciler
+	meterReconciler *MeterDefinitionReconciler
 
 	// fakeRecorder captures k8s events emitted by the reconciler so tests
 	// can assert Synced/SyncFailed/etc. by reason without reaching into
@@ -136,6 +137,13 @@ var _ = BeforeSuite(func() {
 		Recorder:       fakeRecorder,
 	}
 	Expect(reconciler.SetupWithManager(mgr)).To(Succeed())
+
+	meterReconciler = &MeterDefinitionReconciler{
+		Client:         mgr.GetClient(),
+		AmberfloClient: amberfloClient,
+		Recorder:       fakeRecorder,
+	}
+	Expect(meterReconciler.SetupWithManager(mgr)).To(Succeed())
 
 	go func() {
 		defer GinkgoRecover()

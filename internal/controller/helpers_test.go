@@ -23,6 +23,97 @@ import (
 	. "github.com/onsi/gomega"
 )
 
+var _ = Describe("amberfloMeterType", func() {
+	It("maps the supported Milo aggregations onto Amberflo meterType wire values", func() {
+		cases := map[billingv1alpha1.MeterAggregation]string{
+			billingv1alpha1.MeterAggregationSum:         "sum_of_all_usage",
+			billingv1alpha1.MeterAggregationCount:       "sum_of_all_usage",
+			billingv1alpha1.MeterAggregationUniqueCount: "active_users",
+		}
+		for in, want := range cases {
+			got, ok := amberfloMeterType(in)
+			Expect(ok).To(BeTrue(), "expected %s to be supported", in)
+			Expect(got).To(Equal(want))
+		}
+	})
+	It("returns false for aggregations Amberflo does not expose", func() {
+		for _, in := range []billingv1alpha1.MeterAggregation{
+			billingv1alpha1.MeterAggregationMax,
+			billingv1alpha1.MeterAggregationMin,
+			billingv1alpha1.MeterAggregationLatest,
+			billingv1alpha1.MeterAggregationAverage,
+		} {
+			got, ok := amberfloMeterType(in)
+			Expect(ok).To(BeFalse(), "%s should be unsupported", in)
+			Expect(got).To(BeEmpty())
+		}
+	})
+})
+
+var _ = Describe("desiredMeterFromDefinition", func() {
+	It("maps spec fields onto DesiredMeter with UID-derived APIName", func() {
+		md := &billingv1alpha1.MeterDefinition{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "cpu-seconds",
+				UID:  types.UID("uid-cpu"),
+			},
+			Spec: billingv1alpha1.MeterDefinitionSpec{
+				MeterName:   "compute.miloapis.com/cpu-seconds",
+				DisplayName: "CPU Seconds",
+				Measurement: billingv1alpha1.MeterMeasurement{
+					Unit:       "s",
+					Dimensions: []string{"region", "tier"},
+				},
+			},
+		}
+		got := desiredMeterFromDefinition(md, "sum_of_all_usage")
+		Expect(got.APIName).To(Equal("uid-cpu"))
+		Expect(got.Label).To(Equal("CPU Seconds"))
+		Expect(got.MeterType).To(Equal("sum_of_all_usage"))
+		Expect(got.Unit).To(Equal("s"))
+		Expect(got.Dimensions).To(Equal([]string{"region", "tier"}))
+		// sum_of_all_usage does not use aggregationDimensions.
+		Expect(got.AggregationDimensions).To(BeEmpty())
+	})
+	It("populates aggregationDimensions for active_users", func() {
+		md := &billingv1alpha1.MeterDefinition{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "active-projects",
+				UID:  types.UID("uid-ap"),
+			},
+			Spec: billingv1alpha1.MeterDefinitionSpec{
+				MeterName:   "compute.miloapis.com/active-projects",
+				DisplayName: "Active Projects",
+				Measurement: billingv1alpha1.MeterMeasurement{
+					Unit:       "{project}",
+					Dimensions: []string{"project_id"},
+				},
+			},
+		}
+		got := desiredMeterFromDefinition(md, "active_users")
+		Expect(got.MeterType).To(Equal("active_users"))
+		Expect(got.AggregationDimensions).To(Equal([]string{"project_id"}))
+		Expect(got.Dimensions).To(Equal([]string{"project_id"}))
+	})
+	It("falls back to meterName when displayName is empty", func() {
+		md := &billingv1alpha1.MeterDefinition{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "no-display",
+				UID:  types.UID("uid-nd"),
+			},
+			Spec: billingv1alpha1.MeterDefinitionSpec{
+				MeterName: "compute.miloapis.com/fallback",
+				Measurement: billingv1alpha1.MeterMeasurement{
+					Unit: "{request}",
+				},
+			},
+		}
+		got := desiredMeterFromDefinition(md, "sum_of_all_usage")
+		Expect(got.Label).To(Equal("compute.miloapis.com/fallback"))
+		Expect(got.Dimensions).To(BeNil())
+	})
+})
+
 // Pure-function unit tests for the controller package's helpers. These
 // do not need envtest and run fast.
 

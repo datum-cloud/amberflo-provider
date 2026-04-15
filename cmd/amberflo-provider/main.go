@@ -206,6 +206,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err = (&controller.MeterDefinitionReconciler{
+		Client:         mgr.GetClient(),
+		AmberfloClient: amberfloClient,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "MeterDefinition")
+		os.Exit(1)
+	}
+
 	if err = controller.AddIndexers(ctx, mgr.GetFieldIndexer()); err != nil {
 		setupLog.Error(err, "unable to add indexers")
 		os.Exit(1)

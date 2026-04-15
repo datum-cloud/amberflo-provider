@@ -62,6 +62,21 @@ type Client interface {
 	// GetCustomer fetches the current customer record. Returns
 	// ErrCustomerNotFound on 404.
 	GetCustomer(ctx context.Context, customerID string) (Customer, error)
+
+	// EnsureMeter reconciles the desired meter state against Amberflo,
+	// creating the meter via POST /meters when absent and updating via
+	// PUT /meters when the existing record drifts from desired. Repeated
+	// calls with the same DesiredMeter are no-ops after the first.
+	EnsureMeter(ctx context.Context, desired DesiredMeter) (Meter, error)
+
+	// DeleteMeter removes the meter identified by meterAPIName. 404s are
+	// tolerated as success so the reconciler can cleanly finalize a
+	// MeterDefinition whose Amberflo counterpart is already gone.
+	DeleteMeter(ctx context.Context, meterAPIName string) error
+
+	// GetMeter fetches the current meter record. Returns ErrMeterNotFound
+	// on 404.
+	GetMeter(ctx context.Context, meterAPIName string) (Meter, error)
 }
 
 // ClientOptions configures a Client. BaseURL and APIKey are the only

@@ -38,6 +38,7 @@ type fakeServer struct {
 	mu sync.Mutex
 
 	customers map[string]*storedWireCustomer
+	meters    map[string]*storedWireMeter
 	requests  []recordedRequest
 
 	// failure injection
@@ -57,6 +58,21 @@ type storedWireCustomer struct {
 	CreateTime    int64             `json:"createTime,omitempty"`
 }
 
+// storedWireMeter mirrors the wireMeter shape for tests. Matches the
+// fields the client writes and reads; anything else is discarded on
+// decode.
+type storedWireMeter struct {
+	ID                    string   `json:"id,omitempty"`
+	Label                 string   `json:"label,omitempty"`
+	MeterAPIName          string   `json:"meterApiName"`
+	MeterType             string   `json:"meterType,omitempty"`
+	AggregationDimensions []string `json:"aggregationDimensions"`
+	Unit                  string   `json:"unit,omitempty"`
+	Dimensions            []string `json:"dimensions"`
+	UseInBilling          bool     `json:"useInBilling"`
+	LockingStatus         string   `json:"lockingStatus"`
+}
+
 type recordedRequest struct {
 	Method  string
 	Path    string
@@ -69,6 +85,7 @@ func newFake(t *testing.T) *fakeServer {
 	f := &fakeServer{
 		apiKey:    "unit-test-key",
 		customers: map[string]*storedWireCustomer{},
+		meters:    map[string]*storedWireMeter{},
 	}
 	f.srv = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(f.srv.Close)
@@ -88,6 +105,33 @@ func (f *fakeServer) seed(c storedWireCustomer) {
 		cp.Traits = cloneStringMap(cp.Traits)
 	}
 	f.customers[c.CustomerId] = &cp
+}
+
+// seedMeter installs a meter as if it had already been created. Used by
+// meter_test.go to cover the "meter already exists" and drift branches
+// of EnsureMeter.
+func (f *fakeServer) seedMeter(m storedWireMeter) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cp := m
+	cp.Dimensions = append([]string(nil), m.Dimensions...)
+	cp.AggregationDimensions = append([]string(nil), m.AggregationDimensions...)
+	f.meters[m.MeterAPIName] = &cp
+}
+
+// fetchMeter returns a deep copy of a stored meter or false. Used by
+// assertions that need to read the fake's post-write state.
+func (f *fakeServer) fetchMeter(apiName string) (storedWireMeter, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	m, ok := f.meters[apiName]
+	if !ok {
+		return storedWireMeter{}, false
+	}
+	out := *m
+	out.Dimensions = append([]string(nil), m.Dimensions...)
+	out.AggregationDimensions = append([]string(nil), m.AggregationDimensions...)
+	return out, true
 }
 
 // armFailures queues the next `count` requests to return `status`. When
@@ -175,8 +219,191 @@ func (f *fakeServer) serve(w http.ResponseWriter, r *http.Request) {
 		f.mu.Unlock()
 		writeJSON(w, http.StatusOK, out)
 
+	case r.Method == http.MethodGet && r.URL.Path == "/meters":
+		// List-with-filter: the live API returns [] when no match.
+		// The client only ever uses ?meterApiName=<x>, so that's all we
+		// support. Requests without the filter return every meter (rare
+		// in tests; helpful for debugging).
+		filter := r.URL.Query().Get("meterApiName")
+		f.mu.Lock()
+		out := make([]storedWireMeter, 0, len(f.meters))
+		for _, m := range f.meters {
+			if filter != "" && m.MeterAPIName != filter {
+				continue
+			}
+			// Copy to avoid lock-scope aliasing.
+			cp := *m
+			cp.Dimensions = append([]string(nil), m.Dimensions...)
+			cp.AggregationDimensions = append([]string(nil), m.AggregationDimensions...)
+			out = append(out, cp)
+		}
+		f.mu.Unlock()
+		writeJSON(w, http.StatusOK, out)
+
+	case r.Method == http.MethodPost && r.URL.Path == "/meters":
+		// POST must NOT carry an id. The live API silently ignores any
+		// caller-supplied id and mints its own UUID; we match that
+		// behaviour so tests catch accidental id-on-POST bugs.
+		var in storedWireMeter
+		if err := json.Unmarshal(body, &in); err != nil {
+			http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if in.MeterAPIName == "" {
+			http.Error(w, "meterApiName required", http.StatusBadRequest)
+			return
+		}
+		f.mu.Lock()
+		if existing, ok := f.meters[in.MeterAPIName]; ok {
+			f.mu.Unlock()
+			// Live API behaviour: POST over an existing meterApiName
+			// 400s with "already exists".
+			http.Error(w,
+				`{"errorMessage":"Invalid request: Meter already exists with 'meterApiName': `+existing.MeterAPIName+`"}`,
+				http.StatusBadRequest)
+			return
+		}
+		id := "fake-id-" + in.MeterAPIName
+		// Default lockingStatus to "open" if the caller omitted it —
+		// matches the live API's default. The provider always sends
+		// "close_to_changes" now, so this branch is mostly defensive.
+		locking := in.LockingStatus
+		if locking == "" {
+			locking = "open"
+		}
+		stored := &storedWireMeter{
+			ID:                    id,
+			Label:                 in.Label,
+			MeterAPIName:          in.MeterAPIName,
+			MeterType:             in.MeterType,
+			AggregationDimensions: append([]string(nil), in.AggregationDimensions...),
+			Unit:                  in.Unit,
+			Dimensions:            append([]string(nil), in.Dimensions...),
+			UseInBilling:          in.UseInBilling,
+			LockingStatus:         locking,
+		}
+		f.meters[in.MeterAPIName] = stored
+		out := *stored
+		out.Dimensions = append([]string(nil), stored.Dimensions...)
+		out.AggregationDimensions = append([]string(nil), stored.AggregationDimensions...)
+		f.mu.Unlock()
+		writeJSON(w, http.StatusOK, out)
+
+	case r.Method == http.MethodPut && r.URL.Path == "/meters":
+		// PUT requires both server id and meterApiName in the body.
+		// Live API 400s with "already exists" when id is missing —
+		// that same error is what tripped the earlier e2e run.
+		var in storedWireMeter
+		if err := json.Unmarshal(body, &in); err != nil {
+			http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if in.MeterAPIName == "" {
+			http.Error(w, "meterApiName required", http.StatusBadRequest)
+			return
+		}
+		f.mu.Lock()
+		existing, ok := f.meters[in.MeterAPIName]
+		if !ok {
+			f.mu.Unlock()
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		if in.ID == "" || in.ID != existing.ID {
+			f.mu.Unlock()
+			// Match the live-API error body so tests can inspect it.
+			http.Error(w,
+				`{"errorMessage":"Invalid request: Meter already exists with 'meterApiName': `+existing.MeterAPIName+`"}`,
+				http.StatusBadRequest)
+			return
+		}
+		// Enforce the one-way lockingStatus lifecycle: open →
+		// close_to_changes | close_to_deletions | deprecated;
+		// close_to_changes → deprecated only; deprecated → deprecated
+		// (idempotent). Any backwards transition the live API rejects
+		// with 400.
+		if in.LockingStatus != "" && !lockingTransitionAllowed(existing.LockingStatus, in.LockingStatus) {
+			f.mu.Unlock()
+			http.Error(w,
+				`{"errorMessage":"Invalid lockingStatus transition from `+existing.LockingStatus+` to `+in.LockingStatus+`"}`,
+				http.StatusBadRequest)
+			return
+		}
+		existing.Label = in.Label
+		existing.MeterType = in.MeterType
+		existing.Unit = in.Unit
+		existing.Dimensions = append([]string(nil), in.Dimensions...)
+		existing.AggregationDimensions = append([]string(nil), in.AggregationDimensions...)
+		existing.UseInBilling = in.UseInBilling
+		if in.LockingStatus != "" {
+			existing.LockingStatus = in.LockingStatus
+		}
+		out := *existing
+		out.Dimensions = append([]string(nil), existing.Dimensions...)
+		out.AggregationDimensions = append([]string(nil), existing.AggregationDimensions...)
+		f.mu.Unlock()
+		writeJSON(w, http.StatusOK, out)
+
+	case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/meters/"):
+		// DELETE is keyed by server id. If a caller passes
+		// meterApiName the live API returns 200 with no effect — we
+		// mirror that. Meters must be in `deprecated` to delete;
+		// otherwise 400 (live-API behaviour).
+		id := strings.TrimPrefix(r.URL.Path, "/meters/")
+		f.mu.Lock()
+		var apiName string
+		for _, m := range f.meters {
+			if m.ID == id {
+				apiName = m.MeterAPIName
+				break
+			}
+		}
+		if apiName == "" {
+			f.mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		m := f.meters[apiName]
+		if m.LockingStatus != "deprecated" {
+			status := m.LockingStatus
+			f.mu.Unlock()
+			http.Error(w,
+				`{"errorMessage":"'lockingStatus' `+status+` prevents meter from being deleted."}`,
+				http.StatusBadRequest)
+			return
+		}
+		delete(f.meters, apiName)
+		f.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+
 	default:
 		http.Error(w, "not implemented", http.StatusNotImplemented)
+	}
+}
+
+// lockingTransitionAllowed reports whether the one-way Amberflo
+// lockingStatus state machine permits `from` → `to`. Empty `to` means
+// the caller did not set the field, which the fake treats as "keep
+// the current value" in the PUT handler.
+func lockingTransitionAllowed(from, to string) bool {
+	if from == to {
+		return true
+	}
+	switch from {
+	case "", "open":
+		// open → anything is fine.
+		return true
+	case "close_to_changes":
+		return to == "deprecated"
+	case "close_to_deletions":
+		return to == "deprecated"
+	case "deprecated":
+		// Terminal: only self-loop is allowed.
+		return false
+	default:
+		// Unknown source state — be permissive in the fake so unknown
+		// real-API additions don't break the tests.
+		return true
 	}
 }
 
