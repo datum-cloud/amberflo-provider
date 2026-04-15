@@ -1,0 +1,9 @@
+apiVersion: billing.miloapis.com/v1alpha1
+kind: BillingAccount
+metadata:
+  name: e2e-add
+spec:
+  currencyCode: USD
+  contactInfo:
+    email: e2e-add@example.test
+    name: E2E Add

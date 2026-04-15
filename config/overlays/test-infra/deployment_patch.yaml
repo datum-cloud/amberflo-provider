@@ -1,0 +1,20 @@
+# test-infra overlay patches for the amberflo-provider Deployment.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: amberflo-provider
+spec:
+  template:
+    spec:
+      containers:
+        - name: manager
+          imagePullPolicy: IfNotPresent
+          # Override the base image args so leader election targets the
+          # provider's own namespace (where the leader_election component
+          # installed the Role + RoleBinding). The base manifest pinned
+          # this to kube-system which requires cluster-admin to bind.
+          args:
+            - --leader-elect
+            - --leader-elect-namespace=amberflo-provider-system
+            - --health-probe-bind-address=:8081
+            - --server-config=/config/config.yaml

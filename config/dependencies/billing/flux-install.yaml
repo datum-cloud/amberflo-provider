@@ -1,0 +1,62 @@
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: billing
+  namespace: flux-system
+spec:
+  interval: 10m
+  retryInterval: 1m
+  timeout: 3m
+  prune: true
+  wait: true
+  sourceRef:
+    kind: OCIRepository
+    name: billing
+  path: overlays/dev
+  # Billing's dev overlay ships MutatingWebhookConfiguration/billing-mutating
+  # and ValidatingWebhookConfiguration/billing-validating with
+  # clientConfig.url=host.docker.internal:9443. We rewrite these live to
+  # target the in-cluster billing-webhook Service (see
+  # hack/patch-billing-webhooks.sh). Without the annotations below, Flux
+  # SSA continuously tries to revert our patch, which fails dry-run
+  # validation ("Required value: exactly one of url or service") and
+  # leaves the Kustomization in ReconciliationFailed forever. Telling
+  # Flux to Ignore these objects after first apply lets the shim run
+  # and the cluster settle.
+  patches:
+    - target:
+        kind: MutatingWebhookConfiguration
+        name: billing-mutating
+      patch: |
+        - op: add
+          path: /metadata/annotations/kustomize.toolkit.fluxcd.io~1ssa
+          value: Ignore
+    - target:
+        kind: ValidatingWebhookConfiguration
+        name: billing-validating
+      patch: |
+        - op: add
+          path: /metadata/annotations/kustomize.toolkit.fluxcd.io~1ssa
+          value: Ignore
+    # The shim extends dnsNames to include the in-cluster Service DNS
+    # names so the webhook TLS handshake succeeds. Without Ignore, Flux
+    # continuously reverts that patch and TLS verification fails during
+    # e2e.
+    - target:
+        kind: Certificate
+        name: billing-serving-cert
+      patch: |
+        - op: add
+          path: /metadata/annotations/kustomize.toolkit.fluxcd.io~1ssa
+          value: Ignore
+    # billing-config ConfigMap is pinned by the shim to set
+    # webhookServer.port=9443. Without Ignore, Flux reverts it and
+    # billing-controller-manager picks a random port that the webhook
+    # Service can't reach.
+    - target:
+        kind: ConfigMap
+        name: billing-config
+      patch: |
+        - op: add
+          path: /metadata/annotations/kustomize.toolkit.fluxcd.io~1ssa
+          value: Ignore

@@ -1,0 +1,13 @@
+apiVersion: billing.miloapis.com/v1alpha1
+kind: BillingAccount
+metadata:
+  name: e2e-create
+spec:
+  currencyCode: USD
+  paymentTerms:
+    netDays: 30
+    invoiceFrequency: Monthly
+    invoiceDayOfMonth: 1
+  contactInfo:
+    email: e2e-create@example.test
+    name: E2E Create

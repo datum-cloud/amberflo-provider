@@ -1,0 +1,51 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: delete-handling
+spec:
+  namespace: e2e-delete
+  steps:
+    - name: create BillingAccount and wait for Synced event
+      try:
+        - apply:
+            file: billing-account.yaml
+        - assert:
+            timeout: 120s
+            resource:
+              apiVersion: v1
+              kind: Event
+              involvedObject:
+                apiVersion: billing.miloapis.com/v1alpha1
+                kind: BillingAccount
+                name: e2e-delete
+              reason: Synced
+              type: Normal
+    - name: delete the BillingAccount
+      try:
+        - delete:
+            ref:
+              apiVersion: billing.miloapis.com/v1alpha1
+              kind: BillingAccount
+              name: e2e-delete
+        - error:
+            # The account should have been fully removed (finalizer
+            # released after the DisableCustomer call against the
+            # Amberflo sandbox succeeded).
+            resource:
+              apiVersion: billing.miloapis.com/v1alpha1
+              kind: BillingAccount
+              metadata:
+                name: e2e-delete
+    - name: assert provider emitted a Disabled event
+      try:
+        - assert:
+            timeout: 120s
+            resource:
+              apiVersion: v1
+              kind: Event
+              involvedObject:
+                apiVersion: billing.miloapis.com/v1alpha1
+                kind: BillingAccount
+                name: e2e-delete
+              reason: Disabled
+              type: Normal
