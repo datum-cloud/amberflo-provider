@@ -1,0 +1,17 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: amberflo-provider-system
+
+resources:
+  - namespace.yaml
+  - ../../base/manager
+
+components:
+  - ../../components/leader_election
+
+patches:
+  - target:
+      kind: Deployment
+      name: amberflo-provider
+    path: config.yaml

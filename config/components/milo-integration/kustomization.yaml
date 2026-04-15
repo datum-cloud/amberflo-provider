@@ -1,0 +1,54 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+# milo-integration wires the amberflo-provider controller into a Milo
+# control plane. It mounts a discovery kubeconfig ConfigMap (consumer
+# responsibility) and, in future, a client cert issued by Milo's cluster
+# issuer. For M0 this is a scaffolding stub; the full wiring follows the
+# pattern used by billing/config/components/milo-integration. Consumers
+# are expected to:
+#
+#   1. Provide a ConfigMap named amberflo-provider-discovery-kubeconfig
+#      containing a kubeconfig pointing at the Milo API server.
+#   2. Label the namespace with
+#      infra.datum.net/inject-datum-control-plane-trust-bundle: "" so
+#      trust-manager populates the datum-control-plane-trust-bundle
+#      ConfigMap.
+#
+# Once those preconditions are in place, this component will mount both
+# sources into /etc/kubernetes/project-discovery/auth and
+# /etc/kubernetes/pki/trust respectively.
+
+patches:
+  - target:
+      kind: Deployment
+      name: amberflo-provider
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: amberflo-provider
+      spec:
+        template:
+          spec:
+            containers:
+              - name: manager
+                args:
+                  - --leader-elect
+                  - --leader-elect-namespace=kube-system
+                  - --health-probe-bind-address=:8081
+                  - --server-config=/config/config.yaml
+                volumeMounts:
+                  - mountPath: /etc/kubernetes/pki/trust
+                    name: trust-bundle
+                    readOnly: true
+                  - mountPath: /etc/kubernetes/project-discovery/auth
+                    name: discovery-kubeconfig
+                    readOnly: true
+            volumes:
+              - name: trust-bundle
+                configMap:
+                  name: datum-control-plane-trust-bundle
+              - name: discovery-kubeconfig
+                configMap:
+                  name: amberflo-provider-discovery-kubeconfig

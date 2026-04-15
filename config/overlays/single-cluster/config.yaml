@@ -1,0 +1,3 @@
+# Placeholder overlay config. Consumers can supply image pins, resource
+# overrides, and component additions via their own kustomization.yaml
+# that uses this overlay as a base.

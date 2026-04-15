@@ -1,0 +1,26 @@
+# Shim RBAC for the billing controller-manager.
+#
+# Billing's published `overlays/dev` bundle (ghcr.io/datum-cloud/billing-kustomize)
+# omits the ClusterRole/ClusterRoleBinding its controllers need for
+# watching billing resources across the cluster. Without this, the
+# billing webhooks fail on DELETE (they list bindings to enforce
+# referential integrity) and billing's own reconcilers error out.
+#
+# We compensate by binding the billing controller-manager ServiceAccount
+# to cluster-admin for the duration of the e2e run. This is only
+# applied in the test harness — real deployments consume billing's
+# published bundle directly once its dev overlay is fixed upstream.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: amberflo-provider-e2e-billing-admin
+  labels:
+    app.kubernetes.io/name: amberflo-provider-e2e
+subjects:
+  - kind: ServiceAccount
+    name: billing-controller-manager
+    namespace: billing-system
+roleRef:
+  kind: ClusterRole
+  name: cluster-admin
+  apiGroup: rbac.authorization.k8s.io

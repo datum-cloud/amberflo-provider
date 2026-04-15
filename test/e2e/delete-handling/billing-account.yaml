@@ -1,0 +1,6 @@
+apiVersion: billing.miloapis.com/v1alpha1
+kind: BillingAccount
+metadata:
+  name: e2e-delete
+spec:
+  currencyCode: USD
