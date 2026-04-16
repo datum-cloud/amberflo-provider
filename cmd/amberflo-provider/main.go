@@ -111,9 +111,9 @@ func main() {
 
 	setupLog.Info("server config", "config", serverConfig)
 
-	// Billing resources live in the Milo control plane, not necessarily
-	// in the cluster that hosts this controller pod. Connect to Milo
-	// using the configured kubeconfig path, falling back to
+	// Billing and services resources live in the Milo control plane, not
+	// necessarily in the cluster that hosts this controller pod. Connect
+	// to Milo using the configured kubeconfig path, falling back to
 	// ctrl.GetConfig() for local / in-cluster development where the two
 	// clusters happen to be the same.
 	cfg, err := serverConfig.RestConfig()

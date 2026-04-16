@@ -86,8 +86,8 @@ var _ = BeforeSuite(func() {
 	By("bootstrapping test environment")
 	testEnv = &envtest.Environment{
 		CRDDirectoryPaths: []string{
-			// Milo's BillingAccount + BillingAccountBinding CRDs. We
-			// resolve the billing module path dynamically so the same
+			// Milo's BillingAccount + BillingAccountBinding + MeterDefinition CRDs.
+			// We resolve the billing module path dynamically so the same
 			// suite works against both a sibling checkout (via go.mod
 			// replace) and a module-cache copy fetched from the proxy.
 			billingCRDPath(),

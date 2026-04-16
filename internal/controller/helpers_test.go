@@ -64,6 +64,10 @@ var _ = Describe("desiredMeterFromDefinition", func() {
 					Unit:       "s",
 					Dimensions: []string{"region", "tier"},
 				},
+				Billing: billingv1alpha1.MeterBilling{
+					ConsumedUnit: "s",
+					PricingUnit:  "h",
+				},
 			},
 		}
 		got := desiredMeterFromDefinition(md, "sum_of_all_usage")
@@ -88,6 +92,10 @@ var _ = Describe("desiredMeterFromDefinition", func() {
 					Unit:       "{project}",
 					Dimensions: []string{"project_id"},
 				},
+				Billing: billingv1alpha1.MeterBilling{
+					ConsumedUnit: "{project}",
+					PricingUnit:  "{project}",
+				},
 			},
 		}
 		got := desiredMeterFromDefinition(md, "active_users")
@@ -105,6 +113,10 @@ var _ = Describe("desiredMeterFromDefinition", func() {
 				MeterName: "compute.miloapis.com/fallback",
 				Measurement: billingv1alpha1.MeterMeasurement{
 					Unit: "{request}",
+				},
+				Billing: billingv1alpha1.MeterBilling{
+					ConsumedUnit: "{request}",
+					PricingUnit:  "{request}",
 				},
 			},
 		}

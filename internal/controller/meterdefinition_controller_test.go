@@ -32,7 +32,7 @@ import (
 func meterKey(name string) client.ObjectKey { return client.ObjectKey{Name: name} }
 
 // newMeterDefinition returns a valid, usage-categorized, sum-aggregated
-// MeterDefinition with a reverse-DNS meterName prefixed by owner.service.
+// MeterDefinition with a reverse-DNS meterName.
 // The caller supplies only the short name suffix so specs do not collide
 // across the shared envtest.
 func newMeterDefinition(nameSuffix string) *billingv1alpha1.MeterDefinition {
@@ -42,17 +42,16 @@ func newMeterDefinition(nameSuffix string) *billingv1alpha1.MeterDefinition {
 		},
 		Spec: billingv1alpha1.MeterDefinitionSpec{
 			MeterName:   "compute.miloapis.com/" + nameSuffix,
+			Phase:       billingv1alpha1.PhasePublished,
 			DisplayName: "Display " + nameSuffix,
-			Owner:       billingv1alpha1.MeterOwner{Service: "compute.miloapis.com"},
 			Measurement: billingv1alpha1.MeterMeasurement{
 				Aggregation: billingv1alpha1.MeterAggregationSum,
 				Unit:        "s",
 				Dimensions:  []string{"region", "tier"},
 			},
 			Billing: billingv1alpha1.MeterBilling{
-				ConsumedUnit:   "s",
-				PricingUnit:    "h",
-				ChargeCategory: billingv1alpha1.MeterChargeCategoryUsage,
+				ConsumedUnit: "s",
+				PricingUnit:  "h",
 			},
 		},
 	}
@@ -284,24 +283,4 @@ var _ = Describe("MeterDefinitionReconciler", func() {
 		})
 	})
 
-	Context("UnsupportedChargeCategory_SkipsSync", func() {
-		It("emits SyncSkipped and issues no /meters writes for non-Usage", func() {
-			md := newMeterDefinition("purchase-skipped")
-			md.Spec.Billing.ChargeCategory = billingv1alpha1.MeterChargeCategoryPurchase
-			mustCreate(ctx, md)
-			DeferCleanup(func() {
-				mustDelete(ctx, md)
-				waitForMeterGone(meterKey(md.Name))
-			})
-
-			ev := waitForEventReason(EventReasonSyncSkipped)
-			Expect(ev).To(ContainSubstring(skipReasonUnsupportedChargeCategory))
-
-			time.Sleep(500 * time.Millisecond)
-			for _, req := range fakeHTTP.Requests() {
-				Expect(req.Path).NotTo(HavePrefix("/meters"),
-					"unexpected /meters request: %s %s", req.Method, req.Path)
-			}
-		})
-	})
 })

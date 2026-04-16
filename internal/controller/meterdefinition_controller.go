@@ -46,8 +46,7 @@ const (
 	EventReasonDeleteFailed = "DeleteFailed"
 
 	// SyncSkipped reason tags surfaced in event messages.
-	skipReasonUnsupportedAggregation    = "UnsupportedAggregation"
-	skipReasonUnsupportedChargeCategory = "UnsupportedChargeCategory"
+	skipReasonUnsupportedAggregation = "UnsupportedAggregation"
 	// skipReasonMissingDimensions is emitted when a UniqueCount meter
 	// declares no dimensions — Amberflo's active_users meterType
 	// requires at least one aggregationDimension or it 400s on POST.
@@ -64,7 +63,7 @@ const (
 	meterControllerName = "meterdefinition"
 )
 
-// MeterDefinitionReconciler reconciles a billing.miloapis.com/v1alpha1
+// MeterDefinitionReconciler reconciles a services.miloapis.com/v1alpha1
 // MeterDefinition into an Amberflo meter via the amberflo.Client. State
 // surfacing happens via Kubernetes Events and the shared
 // amberflo_provider_reconcile_duration_seconds metric — the reconciler
@@ -132,28 +131,11 @@ func (r *MeterDefinitionReconciler) Reconcile(ctx context.Context, req reconcile
 		return ctrl.Result{}, nil
 	}
 
-	// TODO(upstream-trim): remove this filter once billing CRD drops the chargeCategory field.
-	// Until then: spec.billing.chargeCategory is mutable, so a Usage→Purchase transition will
-	// leave the previously-synced Amberflo meter in place (we emit SyncSkipped but do not
-	// delete). Acceptable for v1 because the field is being removed upstream; do not build
-	// delete-on-transition logic for code that is about to be deleted.
-	if md.Spec.Billing.ChargeCategory != billingv1alpha1.MeterChargeCategoryUsage {
-		logger.Info("skipping sync: unsupported chargeCategory",
-			"chargeCategory", md.Spec.Billing.ChargeCategory)
-		if r.Recorder != nil {
-			r.Recorder.Eventf(&md, "Normal", EventReasonSyncSkipped,
-				"%s: chargeCategory=%s is not supported",
-				skipReasonUnsupportedChargeCategory, md.Spec.Billing.ChargeCategory)
-		}
-		return ctrl.Result{}, nil
-	}
-
-	// TODO(upstream-trim): Amberflo's POST /meters only accepts a narrow
-	// subset of meterTypes today (sum_of_all_usage, active_users,
-	// event_duration). We map Sum/Count→sum_of_all_usage and
-	// UniqueCount→active_users; Max/Min/Latest/Average have no native
-	// Amberflo equivalent and are skipped. Revisit if billing narrows
-	// the enum, or if amberflo-provider grows derived-meter-group
+	// Amberflo's POST /meters only accepts a narrow subset of meterTypes
+	// today (sum_of_all_usage, active_users, event_duration). We map
+	// Sum/Count→sum_of_all_usage and UniqueCount→active_users;
+	// Max/Min/Latest/Average have no native Amberflo equivalent and are
+	// skipped. Revisit if amberflo-provider grows derived-meter-group
 	// support for the unmapped values.
 	meterType, ok := amberfloMeterType(md.Spec.Measurement.Aggregation)
 	if !ok {
@@ -298,8 +280,8 @@ func (r *MeterDefinitionReconciler) handleAmberfloError(
 //   - UniqueCount → active_users (requires ≥1 aggregationDimension)
 //   - Max/Min/Latest/Average → unsupported, return false
 //
-// TODO(upstream-trim): revisit if/when billing narrows the enum or
-// amberflo-provider grows support for derived-meter-group rollups.
+// Revisit if/when amberflo-provider grows support for derived-meter-group
+// rollups.
 func amberfloMeterType(a billingv1alpha1.MeterAggregation) (string, bool) {
 	switch a {
 	case billingv1alpha1.MeterAggregationSum,
@@ -320,11 +302,6 @@ func amberfloMeterType(a billingv1alpha1.MeterAggregation) (string, bool) {
 // exceed Amberflo's id character set. Label is spec.displayName with a
 // fallback to spec.meterName so the Amberflo UI always has a
 // non-empty human-readable label.
-//
-// TODO(upstream-trim): spec.billing.consumedUnit and spec.billing.pricingUnit
-// are intentionally ignored — upstream PR #6 is trimming the billing
-// substruct, and Amberflo only models a single meter unit. If those
-// fields survive in the merged shape, revisit this mapping.
 //
 // AggregationDimensions handling: active_users requires the full
 // dimension list to identify the "thing" being uniquely counted (e.g.
