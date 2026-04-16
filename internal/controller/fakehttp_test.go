@@ -35,6 +35,7 @@ type recordingFakeServer struct {
 
 	mu         sync.Mutex
 	customers  map[string]*storedCustomer
+	meters     map[string]*storedMeter
 	requests   []recordedRequest
 	failStatus int
 	failCount  int
@@ -49,6 +50,22 @@ type storedCustomer struct {
 	Traits        map[string]string `json:"traits,omitempty"`
 }
 
+// storedMeter mirrors the Amberflo meter wire shape the client writes. We
+// only persist the fields the reconciler reads back; anything else is
+// discarded on decode. The fake treats meterApiName as the primary key
+// (matching Amberflo's caller-supplied id semantics).
+type storedMeter struct {
+	ID                    string   `json:"id,omitempty"`
+	Label                 string   `json:"label,omitempty"`
+	MeterAPIName          string   `json:"meterApiName"`
+	MeterType             string   `json:"meterType,omitempty"`
+	AggregationDimensions []string `json:"aggregationDimensions"`
+	Unit                  string   `json:"unit,omitempty"`
+	Dimensions            []string `json:"dimensions"`
+	UseInBilling          bool     `json:"useInBilling"`
+	LockingStatus         string   `json:"lockingStatus"`
+}
+
 // recordedRequest captures a request for post-hoc inspection by tests.
 type recordedRequest struct {
 	Method string
@@ -61,6 +78,7 @@ func newRecordingFakeServer() *recordingFakeServer {
 	f := &recordingFakeServer{
 		apiKey:    "envtest-api-key",
 		customers: map[string]*storedCustomer{},
+		meters:    map[string]*storedMeter{},
 	}
 	f.srv = httptest.NewServer(http.HandlerFunc(f.serve))
 	return f
@@ -80,6 +98,7 @@ func (f *recordingFakeServer) Reset() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.customers = map[string]*storedCustomer{}
+	f.meters = map[string]*storedMeter{}
 	f.requests = nil
 	f.failStatus = 0
 	f.failCount = 0
@@ -102,6 +121,31 @@ func (f *recordingFakeServer) FetchCustomer(id string) (storedCustomer, bool) {
 		return storedCustomer{}, false
 	}
 	return *c, true
+}
+
+// FetchMeter returns a deep copy of a stored meter or false.
+func (f *recordingFakeServer) FetchMeter(apiName string) (storedMeter, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	m, ok := f.meters[apiName]
+	if !ok {
+		return storedMeter{}, false
+	}
+	out := *m
+	out.Dimensions = append([]string(nil), m.Dimensions...)
+	out.AggregationDimensions = append([]string(nil), m.AggregationDimensions...)
+	return out, true
+}
+
+// DeleteMeter removes a meter from the fake's store. Returns whether the
+// meter existed. Test-only helper used to seed a "prior 404" before a
+// reconciler run.
+func (f *recordingFakeServer) DeleteMeter(apiName string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.meters[apiName]
+	delete(f.meters, apiName)
+	return ok
 }
 
 // Requests returns a snapshot of all requests the fake has served.
@@ -173,8 +217,158 @@ func (f *recordingFakeServer) serve(w http.ResponseWriter, r *http.Request) {
 		f.mu.Unlock()
 		writeJSON(w, http.StatusOK, out)
 
+	case r.Method == http.MethodGet && r.URL.Path == "/meters":
+		// List-with-filter — matches the live API. Empty result => [].
+		filter := r.URL.Query().Get("meterApiName")
+		f.mu.Lock()
+		out := make([]storedMeter, 0, len(f.meters))
+		for _, m := range f.meters {
+			if filter != "" && m.MeterAPIName != filter {
+				continue
+			}
+			cp := *m
+			cp.Dimensions = append([]string(nil), m.Dimensions...)
+			cp.AggregationDimensions = append([]string(nil), m.AggregationDimensions...)
+			out = append(out, cp)
+		}
+		f.mu.Unlock()
+		writeJSON(w, http.StatusOK, out)
+
+	case r.Method == http.MethodPost && r.URL.Path == "/meters":
+		// POST creates a new record and stamps a server id. Duplicate
+		// meterApiName returns 400 to mirror the live API.
+		var in storedMeter
+		if err := json.Unmarshal(body, &in); err != nil {
+			http.Error(w, fmt.Sprintf("bad json: %v", err), http.StatusBadRequest)
+			return
+		}
+		if in.MeterAPIName == "" {
+			http.Error(w, "meterApiName required", http.StatusBadRequest)
+			return
+		}
+		f.mu.Lock()
+		if _, ok := f.meters[in.MeterAPIName]; ok {
+			f.mu.Unlock()
+			http.Error(w, `{"errorMessage":"Invalid request: Meter already exists"}`, http.StatusBadRequest)
+			return
+		}
+		locking := in.LockingStatus
+		if locking == "" {
+			locking = "open"
+		}
+		f.meters[in.MeterAPIName] = &storedMeter{
+			ID:                    "fake-id-" + in.MeterAPIName,
+			Label:                 in.Label,
+			MeterAPIName:          in.MeterAPIName,
+			MeterType:             in.MeterType,
+			AggregationDimensions: append([]string(nil), in.AggregationDimensions...),
+			Unit:                  in.Unit,
+			Dimensions:            append([]string(nil), in.Dimensions...),
+			UseInBilling:          in.UseInBilling,
+			LockingStatus:         locking,
+		}
+		out := *f.meters[in.MeterAPIName]
+		f.mu.Unlock()
+		writeJSON(w, http.StatusOK, out)
+
+	case r.Method == http.MethodPut && r.URL.Path == "/meters":
+		// PUT requires the server id plus meterApiName in the body.
+		var in storedMeter
+		if err := json.Unmarshal(body, &in); err != nil {
+			http.Error(w, fmt.Sprintf("bad json: %v", err), http.StatusBadRequest)
+			return
+		}
+		if in.MeterAPIName == "" {
+			http.Error(w, "meterApiName required", http.StatusBadRequest)
+			return
+		}
+		f.mu.Lock()
+		existing, ok := f.meters[in.MeterAPIName]
+		if !ok {
+			f.mu.Unlock()
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		if in.ID == "" || in.ID != existing.ID {
+			f.mu.Unlock()
+			http.Error(w, `{"errorMessage":"Invalid request: Meter already exists"}`, http.StatusBadRequest)
+			return
+		}
+		// Enforce one-way lockingStatus transitions (mirrors the live
+		// API). A PUT with an unset lockingStatus is treated as
+		// "don't change it".
+		if in.LockingStatus != "" && !fakeLockingTransitionAllowed(existing.LockingStatus, in.LockingStatus) {
+			f.mu.Unlock()
+			http.Error(w,
+				`{"errorMessage":"Invalid lockingStatus transition from `+existing.LockingStatus+` to `+in.LockingStatus+`"}`,
+				http.StatusBadRequest)
+			return
+		}
+		existing.Label = in.Label
+		existing.MeterType = in.MeterType
+		existing.Unit = in.Unit
+		existing.Dimensions = append([]string(nil), in.Dimensions...)
+		existing.AggregationDimensions = append([]string(nil), in.AggregationDimensions...)
+		existing.UseInBilling = in.UseInBilling
+		if in.LockingStatus != "" {
+			existing.LockingStatus = in.LockingStatus
+		}
+		out := *existing
+		f.mu.Unlock()
+		writeJSON(w, http.StatusOK, out)
+
+	case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/meters/"):
+		// DELETE is keyed by server id. Unknown id => 200 no-op (live
+		// API behaviour). Target must be in `deprecated` to delete.
+		id := strings.TrimPrefix(r.URL.Path, "/meters/")
+		f.mu.Lock()
+		var apiName string
+		for _, m := range f.meters {
+			if m.ID == id {
+				apiName = m.MeterAPIName
+				break
+			}
+		}
+		if apiName == "" {
+			f.mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		m := f.meters[apiName]
+		if m.LockingStatus != "deprecated" {
+			status := m.LockingStatus
+			f.mu.Unlock()
+			http.Error(w,
+				`{"errorMessage":"'lockingStatus' `+status+` prevents meter from being deleted."}`,
+				http.StatusBadRequest)
+			return
+		}
+		delete(f.meters, apiName)
+		f.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+
 	default:
 		http.Error(w, "not implemented", http.StatusNotImplemented)
+	}
+}
+
+// fakeLockingTransitionAllowed mirrors the live-API lifecycle rules:
+// open → anything; close_to_changes|close_to_deletions → deprecated;
+// deprecated is terminal (self-loop only). Unknown source states are
+// permissive to avoid breaking tests on future API additions.
+func fakeLockingTransitionAllowed(from, to string) bool {
+	if from == to {
+		return true
+	}
+	switch from {
+	case "", "open":
+		return true
+	case "close_to_changes", "close_to_deletions":
+		return to == "deprecated"
+	case "deprecated":
+		return false
+	default:
+		return true
 	}
 }
 

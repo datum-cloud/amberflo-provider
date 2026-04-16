@@ -103,6 +103,30 @@ func (ic *InstrumentedClient) GetCustomer(ctx context.Context, customerID string
 	return out, err
 }
 
+// EnsureMeter forwards to the wrapped client while recording metrics.
+func (ic *InstrumentedClient) EnsureMeter(ctx context.Context, desired DesiredMeter) (Meter, error) {
+	start := time.Now()
+	out, err := ic.Client.EnsureMeter(ctx, desired)
+	recordOp("EnsureMeter", start, err)
+	return out, err
+}
+
+// DeleteMeter forwards to the wrapped client while recording metrics.
+func (ic *InstrumentedClient) DeleteMeter(ctx context.Context, meterAPIName string) error {
+	start := time.Now()
+	err := ic.Client.DeleteMeter(ctx, meterAPIName)
+	recordOp("DeleteMeter", start, err)
+	return err
+}
+
+// GetMeter forwards to the wrapped client while recording metrics.
+func (ic *InstrumentedClient) GetMeter(ctx context.Context, meterAPIName string) (Meter, error) {
+	start := time.Now()
+	out, err := ic.Client.GetMeter(ctx, meterAPIName)
+	recordOp("GetMeter", start, err)
+	return out, err
+}
+
 // recordOp records a single outbound Amberflo call. status captures the
 // classified outcome (success, transient, permanent) in lieu of a raw
 // HTTP status — the Client does not expose per-request status codes at
@@ -122,7 +146,7 @@ func classifyForMetrics(err error) (status, class string) {
 	if err == nil {
 		return "success", "2xx"
 	}
-	if errors.Is(err, ErrCustomerNotFound) {
+	if errors.Is(err, ErrCustomerNotFound) || errors.Is(err, ErrMeterNotFound) {
 		return "not_found", "4xx"
 	}
 	var pe *PermanentError

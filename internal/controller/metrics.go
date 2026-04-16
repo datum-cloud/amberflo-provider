@@ -32,7 +32,7 @@ var (
 	reconcileDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name:    "amberflo_provider_reconcile_duration_seconds",
-			Help:    "End-to-end reconcile duration for the billingaccount controller.",
+			Help:    "End-to-end reconcile duration for amberflo-provider controllers.",
 			Buckets: prometheus.DefBuckets,
 		},
 		[]string{"controller", "result"},
@@ -48,8 +48,15 @@ func init() {
 // observeReconcile records a single reconcile outcome for the billing
 // account controller. result is one of: success, error, requeue.
 func observeReconcile(start time.Time, result string) {
+	observeReconcileFor("billingaccount", start, result)
+}
+
+// observeReconcileFor records a single reconcile outcome against a named
+// controller. Used by additional controllers (e.g. meterdefinition) that
+// share the same histogram but vary the controller label.
+func observeReconcileFor(controller string, start time.Time, result string) {
 	reconcileDuration.
-		WithLabelValues("billingaccount", result).
+		WithLabelValues(controller, result).
 		Observe(time.Since(start).Seconds())
 }
 

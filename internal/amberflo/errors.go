@@ -27,6 +27,12 @@ import (
 // errors.Is to decide whether to create or update the customer.
 var ErrCustomerNotFound = errors.New("amberflo: customer not found")
 
+// ErrMeterNotFound is the sentinel returned by GetMeter when Amberflo
+// responds with a 404 for the requested meterApiName. Callers compare with
+// errors.Is to decide whether to create or update the meter, and
+// DeleteMeter treats it as success.
+var ErrMeterNotFound = errors.New("amberflo: meter not found")
+
 // TransientError wraps a failure that the caller should retry with
 // backoff. Network errors, 429s, and 5xx responses all surface as
 // TransientError.

@@ -23,6 +23,7 @@ rules:
   - billing.miloapis.com
   resources:
   - billingaccounts
+  - meterdefinitions
   verbs:
   - get
   - list
@@ -33,5 +34,6 @@ rules:
   - billing.miloapis.com
   resources:
   - billingaccounts/finalizers
+  - meterdefinitions/finalizers
   verbs:
   - update
