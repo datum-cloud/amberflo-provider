@@ -7,9 +7,10 @@ spec:
   interval: 5m
   url: oci://ghcr.io/datum-cloud/billing-kustomize
   # Billing has no semver tags yet. The publish workflow emits
-  # `v0.0.0-<branch>` tags for each merge. We pin to the feat/03
-  # branch tag that currently hosts the active billing implementation.
-  # Bump this deliberately alongside sibling provider repos; when
-  # billing cuts a real release, swap to the semver tag.
+  # `v0.0.0-<branch>` tags for each merge. We pin to the feat/05
+  # branch tag, which adds the MeterDefinition CRD on top of the
+  # earlier feat/03 implementation. Bump this deliberately alongside
+  # sibling provider repos; when billing cuts a real release, swap to
+  # the semver tag.
   ref:
-    tag: v0.0.0-feat-03-implementation
+    tag: v0.0.0-feat-05-meter-definitions

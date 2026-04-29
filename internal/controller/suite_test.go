@@ -62,9 +62,10 @@ var (
 
 	// fakeHTTP is the in-process httptest-backed Amberflo stand-in. The
 	// controller's Amberflo client is wired to this server's URL.
-	fakeHTTP       *recordingFakeServer
-	amberfloClient amberflo.Client
-	reconciler     *BillingAccountReconciler
+	fakeHTTP        *recordingFakeServer
+	amberfloClient  amberflo.Client
+	reconciler      *BillingAccountReconciler
+	meterReconciler *MeterDefinitionReconciler
 
 	// fakeRecorder captures k8s events emitted by the reconciler so tests
 	// can assert Synced/SyncFailed/etc. by reason without reaching into
@@ -85,8 +86,8 @@ var _ = BeforeSuite(func() {
 	By("bootstrapping test environment")
 	testEnv = &envtest.Environment{
 		CRDDirectoryPaths: []string{
-			// Milo's BillingAccount + BillingAccountBinding CRDs. We
-			// resolve the billing module path dynamically so the same
+			// Milo's BillingAccount + BillingAccountBinding + MeterDefinition CRDs.
+			// We resolve the billing module path dynamically so the same
 			// suite works against both a sibling checkout (via go.mod
 			// replace) and a module-cache copy fetched from the proxy.
 			billingCRDPath(),
@@ -136,6 +137,13 @@ var _ = BeforeSuite(func() {
 		Recorder:       fakeRecorder,
 	}
 	Expect(reconciler.SetupWithManager(mgr)).To(Succeed())
+
+	meterReconciler = &MeterDefinitionReconciler{
+		Client:         mgr.GetClient(),
+		AmberfloClient: amberfloClient,
+		Recorder:       fakeRecorder,
+	}
+	Expect(meterReconciler.SetupWithManager(mgr)).To(Succeed())
 
 	go func() {
 		defer GinkgoRecover()

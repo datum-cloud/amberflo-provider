@@ -22,9 +22,12 @@ import (
 
 // stubClient is a minimal Client implementation that returns fixed values.
 type stubClient struct {
-	ensureErr  error
-	disableErr error
-	getErr     error
+	ensureErr         error
+	disableErr        error
+	getErr            error
+	ensureMeterErr    error
+	deleteMeterErr    error
+	getMeterErr       error
 }
 
 func (s *stubClient) EnsureCustomer(ctx context.Context, _ DesiredCustomer) (Customer, error) {
@@ -33,6 +36,13 @@ func (s *stubClient) EnsureCustomer(ctx context.Context, _ DesiredCustomer) (Cus
 func (s *stubClient) DisableCustomer(ctx context.Context, _ string) error { return s.disableErr }
 func (s *stubClient) GetCustomer(ctx context.Context, _ string) (Customer, error) {
 	return Customer{}, s.getErr
+}
+func (s *stubClient) EnsureMeter(ctx context.Context, _ DesiredMeter) (Meter, error) {
+	return Meter{}, s.ensureMeterErr
+}
+func (s *stubClient) DeleteMeter(ctx context.Context, _ string) error { return s.deleteMeterErr }
+func (s *stubClient) GetMeter(ctx context.Context, _ string) (Meter, error) {
+	return Meter{}, s.getMeterErr
 }
 
 func TestInstrumentedClient_DelegatesAndInstruments(t *testing.T) {
@@ -68,6 +78,29 @@ func TestInstrumentedClient_DelegatesAndInstruments(t *testing.T) {
 	stub.getErr = fmt.Errorf("%w: id", ErrCustomerNotFound)
 	if _, err := wrapped.GetCustomer(ctx, "x"); err == nil {
 		t.Errorf("expected error pass-through")
+	}
+
+	if _, err := wrapped.EnsureMeter(ctx, DesiredMeter{APIName: "x"}); err != nil {
+		t.Errorf("EnsureMeter passthrough: %v", err)
+	}
+	if err := wrapped.DeleteMeter(ctx, "x"); err != nil {
+		t.Errorf("DeleteMeter passthrough: %v", err)
+	}
+	if _, err := wrapped.GetMeter(ctx, "x"); err != nil {
+		t.Errorf("GetMeter passthrough: %v", err)
+	}
+
+	stub.ensureMeterErr = &PermanentError{Err: errors.New("e"), StatusCode: 400}
+	if _, err := wrapped.EnsureMeter(ctx, DesiredMeter{APIName: "x"}); err == nil {
+		t.Errorf("expected EnsureMeter error pass-through")
+	}
+	stub.deleteMeterErr = &TransientError{Err: errors.New("t"), StatusCode: 503}
+	if err := wrapped.DeleteMeter(ctx, "x"); err == nil {
+		t.Errorf("expected DeleteMeter error pass-through")
+	}
+	stub.getMeterErr = fmt.Errorf("%w: id", ErrMeterNotFound)
+	if _, err := wrapped.GetMeter(ctx, "x"); err == nil {
+		t.Errorf("expected GetMeter error pass-through")
 	}
 }
 
