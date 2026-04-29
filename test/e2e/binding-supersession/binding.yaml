@@ -1,0 +1,9 @@
+apiVersion: billing.miloapis.com/v1alpha1
+kind: BillingAccountBinding
+metadata:
+  name: sup-binding
+spec:
+  billingAccountRef:
+    name: sup-acct
+  projectRef:
+    name: sup-project

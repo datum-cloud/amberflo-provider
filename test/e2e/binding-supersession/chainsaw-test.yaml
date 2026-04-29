@@ -1,0 +1,75 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: binding-supersession
+spec:
+  namespace: e2e-binding-sup
+  steps:
+    - name: create BillingAccount and wait for Ready
+      try:
+        - apply:
+            file: account.yaml
+        - assert:
+            timeout: 60s
+            resource:
+              apiVersion: billing.miloapis.com/v1alpha1
+              kind: BillingAccount
+              metadata:
+                name: sup-acct
+              status:
+                phase: Ready
+    - name: wait for initial Synced event
+      try:
+        - assert:
+            timeout: 120s
+            resource:
+              apiVersion: v1
+              kind: Event
+              involvedObject:
+                apiVersion: billing.miloapis.com/v1alpha1
+                kind: BillingAccount
+                name: sup-acct
+              reason: Synced
+              type: Normal
+    - name: create a BillingAccountBinding and wait for Active
+      try:
+        - apply:
+            file: binding.yaml
+        - assert:
+            timeout: 60s
+            resource:
+              apiVersion: billing.miloapis.com/v1alpha1
+              kind: BillingAccountBinding
+              metadata:
+                name: sup-binding
+              status:
+                phase: Active
+    - name: mark the binding Superseded via status subresource patch
+      try:
+        - script:
+            content: |
+              set -e
+              kubectl -n e2e-binding-sup patch billingaccountbinding sup-binding \
+                --type=merge --subresource=status \
+                -p '{"status":{"phase":"Superseded"}}'
+            timeout: 60s
+    - name: provider emits Synced after the binding flips Superseded
+      try:
+        - assert:
+            timeout: 120s
+            resource:
+              apiVersion: v1
+              kind: Event
+              involvedObject:
+                apiVersion: billing.miloapis.com/v1alpha1
+                kind: BillingAccount
+                name: sup-acct
+              reason: Synced
+              type: Normal
+    - name: delete the BillingAccount to soft-disable the sandbox customer
+      try:
+        - delete:
+            ref:
+              apiVersion: billing.miloapis.com/v1alpha1
+              kind: BillingAccount
+              name: sup-acct

@@ -26,3 +26,6 @@ cover.out
 # Local env
 .env
 .local/
+
+# Ephemeral clones / scratch for research and investigation
+tmp/

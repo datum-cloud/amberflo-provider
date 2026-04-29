@@ -1,0 +1,49 @@
+# Runs the real-Amberflo sandbox e2e suite on demand. Not run on PRs
+# because `AMBERFLO_API_KEY` is not yet configured as a repo secret.
+name: e2e
+on:
+  workflow_dispatch:
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    env:
+      TASK_X_REMOTE_TASKFILES: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.7'
+          cache: true
+      - uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: datum-cloud/test-infra/.github/actions/kind-bootstrap@v0.6.4
+        with:
+          cluster_name: test-infra
+      - uses: kyverno/action-install-chainsaw@v0.2.12
+      - name: Install dependencies (billing + sandbox credentials)
+        # Requires an AMBERFLO_API_KEY secret populated with a SANDBOX
+        # key; CI cannot run real e2e without one.
+        env:
+          AMBERFLO_API_KEY: ${{ secrets.AMBERFLO_SANDBOX_API_KEY }}
+        run: task test:install-dependencies
+      - name: Build amberflo-provider image
+        run: task dev:build
+      - name: Load amberflo-provider image into kind
+        run: task dev:load
+      - name: Deploy amberflo-provider (test-infra overlay)
+        run: task test:deploy
+      - name: Run chainsaw e2e suite
+        run: task e2e
+      - name: Collect diagnostics on failure
+        if: failure()
+        run: |
+          kubectl -n amberflo-provider-system describe deployment/amberflo-provider || true
+          kubectl -n amberflo-provider-system logs -l control-plane=amberflo-provider --tail=500 || true
+          kubectl -n billing-system logs -l app.kubernetes.io/name=billing --tail=500 || true
+          kubectl get billingaccounts,billingaccountbindings -A -o yaml || true
+      - name: Teardown
+        if: always()
+        run: task test:teardown

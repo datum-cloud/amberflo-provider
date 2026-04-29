@@ -1,0 +1,55 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: customer-create
+spec:
+  namespace: e2e-customer-create
+  steps:
+    - name: create a BillingAccount
+      try:
+        - apply:
+            file: billing-account.yaml
+        - assert:
+            resource:
+              apiVersion: billing.miloapis.com/v1alpha1
+              kind: BillingAccount
+              metadata:
+                name: e2e-create
+              status:
+                phase: Ready
+    - name: assert finalizer is installed by the provider
+      try:
+        - assert:
+            timeout: 90s
+            resource:
+              apiVersion: billing.miloapis.com/v1alpha1
+              kind: BillingAccount
+              metadata:
+                name: e2e-create
+                (finalizers[?@ == 'amberflo.providers.datum.net/customer-link']): ['amberflo.providers.datum.net/customer-link']
+    - name: wait for Synced event
+      try:
+        - assert:
+            timeout: 120s
+            resource:
+              apiVersion: v1
+              kind: Event
+              involvedObject:
+                apiVersion: billing.miloapis.com/v1alpha1
+                kind: BillingAccount
+                name: e2e-create
+              reason: Synced
+              type: Normal
+    - name: delete the BillingAccount to soft-disable the sandbox customer
+      try:
+        - delete:
+            ref:
+              apiVersion: billing.miloapis.com/v1alpha1
+              kind: BillingAccount
+              name: e2e-create
+        - error:
+            resource:
+              apiVersion: billing.miloapis.com/v1alpha1
+              kind: BillingAccount
+              metadata:
+                name: e2e-create

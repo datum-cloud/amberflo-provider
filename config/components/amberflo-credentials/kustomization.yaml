@@ -1,0 +1,54 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+# amberflo-credentials mounts the X-API-KEY value from a Kubernetes
+# Secret into the controller pod at the path that AmberfloProvider
+# config's amberfloAPIKeyPath points to (default
+# /var/run/secrets/amberflo/api-key).
+#
+# Create the referenced Secret with `task test:create-amberflo-credentials`
+# (reads AMBERFLO_API_KEY from a repo-root .env file), or out-of-band:
+#
+#   kubectl create secret generic amberflo-credentials \
+#     --namespace amberflo-provider-system \
+#     --from-literal=api-key="$AMBERFLO_API_KEY"
+#
+# The Secret's `api-key` key is projected as a file named `api-key`
+# inside the mount AND also exported to the container as the env var
+# AMBERFLO_API_KEY. The provider's `loadAPIKey` prefers the file path
+# but falls back to the env var when the file is not present, which is
+# convenient for `go run` invocations and sandbox smoke tests. Rotate
+# by updating the Secret and restarting the Deployment; a rolling
+# restart avoids racing reconciles against a stale key cache.
+
+patches:
+  - target:
+      kind: Deployment
+      name: amberflo-provider
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: amberflo-provider
+      spec:
+        template:
+          spec:
+            containers:
+              - name: manager
+                env:
+                  - name: AMBERFLO_API_KEY
+                    valueFrom:
+                      secretKeyRef:
+                        name: amberflo-credentials
+                        key: api-key
+                volumeMounts:
+                  - mountPath: /var/run/secrets/amberflo
+                    name: amberflo-credentials
+                    readOnly: true
+            volumes:
+              - name: amberflo-credentials
+                secret:
+                  secretName: amberflo-credentials
+                  items:
+                    - key: api-key
+                      path: api-key
