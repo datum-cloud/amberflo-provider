@@ -86,47 +86,21 @@ func TestEnsureProductPlan_CreatesFlatUsage(t *testing.T) {
 	}
 }
 
-func TestEnsureProductPlan_ReusesPortalProductItemByMeter(t *testing.T) {
+func TestEnsureProductPlan_CreatesProductItemName(t *testing.T) {
 	c, f := newTestClient(t)
-	portalItemID := "portal-item-cpu"
-	f.mu.Lock()
-	f.productItems[portalItemID] = &wireProductItem{
-		ID:              portalItemID,
-		ProductItemName: "CPU Allocated",
-		MeterAPIName:    "meter-uid-cpu",
-		ProductID:       "1",
-	}
-	f.mu.Unlock()
-
 	if _, err := c.EnsureProductPlan(context.Background(), baseDesiredProductPlan()); err != nil {
 		t.Fatalf("EnsureProductPlan: %v", err)
 	}
-
-	f.mu.Lock()
-	plan := f.productPlans["offer-uid-1"]
-	priceID := productItemPriceID("offer-uid-1", "cpu-allocated")
-	price := f.itemPrices[priceID]
-	f.mu.Unlock()
-
-	if _, ok := f.productItems["meter-uid-cpu"]; ok {
-		t.Fatal("expected no new product item keyed by meter uid")
-	}
-	if plan.ProductItemPriceIdsMap[portalItemID] != priceID {
-		t.Fatalf("price map=%v, want key %q", plan.ProductItemPriceIdsMap, portalItemID)
-	}
-	if price.ProductItemID != portalItemID {
-		t.Fatalf("ProductItemID=%q, want %q", price.ProductItemID, portalItemID)
-	}
-
-	posts := 0
 	for _, req := range f.requestsCopy() {
-		if req.Method == http.MethodPost && req.Path == productItemsPath {
-			posts++
+		if req.Method != http.MethodPost || req.Path != productItemsPath {
+			continue
 		}
+		if !strings.Contains(string(req.Body), `"productItemName"`) {
+			t.Fatalf("product item POST missing productItemName: %s", req.Body)
+		}
+		return
 	}
-	if posts != 0 {
-		t.Fatalf("expected no product item POST, got %d", posts)
-	}
+	t.Fatal("expected product item POST")
 }
 
 func TestEnsureProductPlan_TieredGraduated(t *testing.T) {

@@ -28,7 +28,6 @@ import (
 // Amberflo account-pricing paths used by the product-plan client.
 const (
 	productItemsPath      = "/payments/pricing/amberflo/account-pricing/product-items"
-	productItemsListPath  = "/payments/pricing/amberflo/account-pricing/product-items/list"
 	productItemPricePath  = "/payments/pricing/amberflo/account-pricing/product-item-price"
 	productPlansPath      = "/payments/pricing/amberflo/account-pricing/product-plans"
 	defaultProductPlanPID = "1"
@@ -254,13 +253,12 @@ func (c *client) EnsureProductPlan(ctx context.Context, desired DesiredProductPl
 			if item.MeterAPIName == "" {
 				return ProductPlan{}, &PermanentError{Err: fmt.Errorf("DesiredPlanItem %q: MeterAPIName is required for usage", item.ID)}
 			}
-			productItemID, err := c.ensureProductItem(ctx, wireProductItem{
+			if err := c.ensureProductItem(ctx, wireProductItem{
 				ID:              item.MeterAPIName,
 				ProductItemName: firstNonEmpty(item.Label, item.MeterAPIName),
 				MeterAPIName:    item.MeterAPIName,
 				ProductID:       productID,
-			})
-			if err != nil {
+			}); err != nil {
 				return ProductPlan{}, err
 			}
 			priceID := productItemPriceID(desired.ID, item.ID)
@@ -274,14 +272,14 @@ func (c *client) EnsureProductPlan(ctx context.Context, desired DesiredProductPl
 			}
 			if err := c.ensureProductItemPrice(ctx, wireProductItemPrice{
 				ID:                   priceID,
-				ProductItemID:        productItemID,
+				ProductItemID:        item.MeterAPIName,
 				ProductItemPriceName: firstNonEmpty(item.Label, item.ID),
 				Price:                priceRaw,
 				LockingStatus:        lockingStatusClose,
 			}); err != nil {
 				return ProductPlan{}, err
 			}
-			priceIDs[productItemID] = priceID
+			priceIDs[item.MeterAPIName] = priceID
 		case PlanChargeTypeOneTime, PlanChargeTypeRecurring:
 			feeMap[item.ID] = wirePlanFee{
 				Name:         firstNonEmpty(item.Label, item.ID),
@@ -374,53 +372,24 @@ func (c *client) DeleteProductPlan(ctx context.Context, id string) error {
 	return nil
 }
 
-func (c *client) ensureProductItem(ctx context.Context, item wireProductItem) (string, error) {
+func (c *client) ensureProductItem(ctx context.Context, item wireProductItem) error {
 	if item.ID == "" {
-		return "", &PermanentError{Err: errors.New("product item id is required")}
+		return &PermanentError{Err: errors.New("product item id is required")}
 	}
 	path := accountPricingQueryPath(productItemsPath, productItemIDQueryParam, item.ID)
 	var got wireProductItem
 	_, _, err := c.doJSON(ctx, http.MethodGet, path, nil, &got)
 	if err == nil && got.ID != "" {
-		return got.ID, nil
+		return nil
 	}
 	if err != nil {
 		var perm *PermanentError
 		if !errors.As(err, &perm) || perm.StatusCode != http.StatusNotFound {
-			return "", err
+			return err
 		}
 	}
-
-	// Portal-created items may share a meterApiName but use a different id.
-	if item.MeterAPIName != "" {
-		existing, found, err := c.findProductItemByMeter(ctx, item.MeterAPIName)
-		if err != nil {
-			return "", err
-		}
-		if found {
-			return existing.ID, nil
-		}
-	}
-
 	_, _, err = c.doJSON(ctx, http.MethodPost, productItemsPath, item, nil)
-	if err != nil {
-		return "", err
-	}
-	return item.ID, nil
-}
-
-func (c *client) findProductItemByMeter(ctx context.Context, meterAPIName string) (wireProductItem, bool, error) {
-	var items []wireProductItem
-	_, _, err := c.doJSON(ctx, http.MethodGet, productItemsListPath, nil, &items)
-	if err != nil {
-		return wireProductItem{}, false, err
-	}
-	for _, item := range items {
-		if item.MeterAPIName == meterAPIName && item.ID != "" {
-			return item, true, nil
-		}
-	}
-	return wireProductItem{}, false, nil
+	return err
 }
 
 func (c *client) ensureProductItemPrice(ctx context.Context, price wireProductItemPrice) error {

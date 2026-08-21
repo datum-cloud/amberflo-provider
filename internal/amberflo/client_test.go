@@ -507,18 +507,6 @@ func (f *fakeServer) servePricing(w http.ResponseWriter, r *http.Request, body [
 		writeJSON(w, http.StatusOK, item)
 		return true
 
-	case r.Method == http.MethodGet && r.URL.Path == productItemsListPath:
-		f.mu.Lock()
-		out := make([]wireProductItem, 0, len(f.productItems))
-		for _, item := range f.productItems {
-			if item != nil {
-				out = append(out, *item)
-			}
-		}
-		f.mu.Unlock()
-		writeJSON(w, http.StatusOK, out)
-		return true
-
 	case r.Method == http.MethodPost && r.URL.Path == productItemsPath:
 		var in wireProductItem
 		if err := json.Unmarshal(body, &in); err != nil || in.ID == "" || in.ProductItemName == "" {
