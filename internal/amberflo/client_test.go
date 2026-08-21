@@ -507,13 +507,32 @@ func (f *fakeServer) servePricing(w http.ResponseWriter, r *http.Request, body [
 		writeJSON(w, http.StatusOK, item)
 		return true
 
+	case r.Method == http.MethodGet && r.URL.Path == productItemsListPath:
+		f.mu.Lock()
+		out := make([]wireProductItem, 0, len(f.productItems))
+		for _, item := range f.productItems {
+			if item != nil {
+				out = append(out, *item)
+			}
+		}
+		f.mu.Unlock()
+		writeJSON(w, http.StatusOK, out)
+		return true
+
 	case r.Method == http.MethodPost && r.URL.Path == productItemsPath:
 		var in wireProductItem
-		if err := json.Unmarshal(body, &in); err != nil || in.ID == "" {
+		if err := json.Unmarshal(body, &in); err != nil || in.ID == "" || in.ProductItemName == "" {
 			http.Error(w, "bad product item", http.StatusBadRequest)
 			return true
 		}
 		f.mu.Lock()
+		for _, existing := range f.productItems {
+			if existing != nil && existing.MeterAPIName == in.MeterAPIName {
+				f.mu.Unlock()
+				http.Error(w, `{"errorMessage":"Some items of a product (1) have the same meter"}`, http.StatusBadRequest)
+				return true
+			}
+		}
 		cp := in
 		f.productItems[in.ID] = &cp
 		f.mu.Unlock()
@@ -575,6 +594,13 @@ func (f *fakeServer) servePricing(w http.ResponseWriter, r *http.Request, body [
 			return true
 		}
 		f.mu.Lock()
+		for productItemID := range in.ProductItemPriceIdsMap {
+			if _, ok := f.productItems[productItemID]; !ok {
+				f.mu.Unlock()
+				http.Error(w, "missing product item "+productItemID, http.StatusBadRequest)
+				return true
+			}
+		}
 		cp := in
 		if in.ProductItemPriceIdsMap != nil {
 			cp.ProductItemPriceIdsMap = maps.Clone(in.ProductItemPriceIdsMap)
