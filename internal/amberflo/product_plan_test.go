@@ -247,6 +247,34 @@ func TestDeleteProductPlan_RemovesExisting(t *testing.T) {
 	}
 }
 
+func TestEnsureProductPlan_GetUsesQueryParams(t *testing.T) {
+	c, f := newTestClient(t)
+	if _, err := c.EnsureProductPlan(context.Background(), baseDesiredProductPlan()); err != nil {
+		t.Fatalf("EnsureProductPlan: %v", err)
+	}
+
+	for _, req := range f.requestsCopy() {
+		if req.Method != http.MethodGet {
+			continue
+		}
+		switch req.Path {
+		case productPlansPath:
+			if req.Query != "productPlanId=offer-uid-1" {
+				t.Errorf("product plan GET query=%q, want productPlanId=offer-uid-1", req.Query)
+			}
+		case productItemsPath:
+			if req.Query != "productItemId=meter-uid-cpu" {
+				t.Errorf("product item GET query=%q, want productItemId=meter-uid-cpu", req.Query)
+			}
+		case productItemPricePath:
+			wantID := productItemPriceID("offer-uid-1", "cpu-allocated")
+			if req.Query != "id="+wantID {
+				t.Errorf("product item price GET query=%q, want id=%s", req.Query, wantID)
+			}
+		}
+	}
+}
+
 func TestEnsureProductPlan_EmptyIDPermanent(t *testing.T) {
 	c, _ := newTestClient(t)
 	_, err := c.EnsureProductPlan(context.Background(), DesiredProductPlan{})

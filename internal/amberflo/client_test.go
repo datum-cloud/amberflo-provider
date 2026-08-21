@@ -86,6 +86,7 @@ type storedWireMeter struct {
 type recordedRequest struct {
 	Method  string
 	Path    string
+	Query   string
 	Headers http.Header
 	Body    []byte
 }
@@ -194,6 +195,7 @@ func (f *fakeServer) serve(w http.ResponseWriter, r *http.Request) {
 	f.requests = append(f.requests, recordedRequest{
 		Method:  r.Method,
 		Path:    r.URL.Path,
+		Query:   r.URL.RawQuery,
 		Headers: r.Header.Clone(),
 		Body:    append([]byte(nil), body...),
 	})
@@ -489,13 +491,17 @@ func (f *fakeServer) serve(w http.ResponseWriter, r *http.Request) {
 // customer-pricing routes used by EnsureProductPlan / EnsureCustomerPlan.
 func (f *fakeServer) servePricing(w http.ResponseWriter, r *http.Request, body []byte) bool {
 	switch {
-	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, productItemsPath+"/"):
-		id := strings.TrimPrefix(r.URL.Path, productItemsPath+"/")
+	case r.Method == http.MethodGet && r.URL.Path == productItemsPath:
+		id := r.URL.Query().Get("productItemId")
+		if id == "" {
+			http.Error(w, "productItemId required", http.StatusBadRequest)
+			return true
+		}
 		f.mu.Lock()
 		item, ok := f.productItems[id]
 		f.mu.Unlock()
 		if !ok {
-			http.Error(w, "not found", http.StatusNotFound)
+			writeJSON(w, http.StatusOK, nil)
 			return true
 		}
 		writeJSON(w, http.StatusOK, item)
@@ -514,13 +520,17 @@ func (f *fakeServer) servePricing(w http.ResponseWriter, r *http.Request, body [
 		writeJSON(w, http.StatusOK, in)
 		return true
 
-	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, productItemPricePath+"/"):
-		id := strings.TrimPrefix(r.URL.Path, productItemPricePath+"/")
+	case r.Method == http.MethodGet && r.URL.Path == productItemPricePath:
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			http.Error(w, "id required", http.StatusBadRequest)
+			return true
+		}
 		f.mu.Lock()
 		price, ok := f.itemPrices[id]
 		f.mu.Unlock()
 		if !ok {
-			http.Error(w, "not found", http.StatusNotFound)
+			writeJSON(w, http.StatusOK, nil)
 			return true
 		}
 		writeJSON(w, http.StatusOK, price)
@@ -542,13 +552,17 @@ func (f *fakeServer) servePricing(w http.ResponseWriter, r *http.Request, body [
 		writeJSON(w, http.StatusOK, in)
 		return true
 
-	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, productPlansPath+"/"):
-		id := strings.TrimPrefix(r.URL.Path, productPlansPath+"/")
+	case r.Method == http.MethodGet && r.URL.Path == productPlansPath:
+		id := r.URL.Query().Get("productPlanId")
+		if id == "" {
+			http.Error(w, "productPlanId required", http.StatusBadRequest)
+			return true
+		}
 		f.mu.Lock()
 		plan, ok := f.productPlans[id]
 		f.mu.Unlock()
 		if !ok {
-			http.Error(w, "not found", http.StatusNotFound)
+			writeJSON(w, http.StatusOK, nil)
 			return true
 		}
 		writeJSON(w, http.StatusOK, plan)
@@ -573,8 +587,12 @@ func (f *fakeServer) servePricing(w http.ResponseWriter, r *http.Request, body [
 		writeJSON(w, http.StatusOK, in)
 		return true
 
-	case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, productPlansPath+"/"):
-		id := strings.TrimPrefix(r.URL.Path, productPlansPath+"/")
+	case r.Method == http.MethodDelete && r.URL.Path == productPlansPath:
+		id := r.URL.Query().Get("productPlanId")
+		if id == "" {
+			http.Error(w, "productPlanId required", http.StatusBadRequest)
+			return true
+		}
 		f.mu.Lock()
 		plan, ok := f.productPlans[id]
 		if !ok {
