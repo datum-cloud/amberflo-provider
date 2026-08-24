@@ -596,6 +596,18 @@ func (f *fakeServer) servePricing(w http.ResponseWriter, r *http.Request, body [
 		if in.FeeMap != nil {
 			cp.FeeMap = maps.Clone(in.FeeMap)
 		}
+		if in.PlanGenerator != nil {
+			g := *in.PlanGenerator
+			g.PriceGenerators = append([]wirePriceGenerator(nil), g.PriceGenerators...)
+			for i := range g.PriceGenerators {
+				g.PriceGenerators[i].PriceTiers = append(json.RawMessage(nil), g.PriceGenerators[i].PriceTiers...)
+				g.PriceGenerators[i].DimensionKeys = append([]string(nil), g.PriceGenerators[i].DimensionKeys...)
+			}
+			if g.FeeMap != nil {
+				g.FeeMap = maps.Clone(g.FeeMap)
+			}
+			cp.PlanGenerator = &g
+		}
 		f.productPlans[in.ID] = &cp
 		f.mu.Unlock()
 		writeJSON(w, http.StatusOK, in)

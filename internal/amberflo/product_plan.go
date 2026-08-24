@@ -35,6 +35,15 @@ const (
 	priceMachineDimMatrix = "DimensionMatrixNode"
 	lockingStatusClose    = "close_to_changes"
 
+	// Amberflo's pricing UI lists Product Plans that were created as a
+	// custom_pricing_plan with a planGenerator. POSTing only
+	// productItemPriceIdsMap stores a usable plan for invoicing but
+	// leaves type empty, so the plan is invisible in Pricing.
+	productPlanTypeCustom    = "custom_pricing_plan"
+	priceGeneratorTypeNoDim  = "usage_based_no_dimension"
+	priceGeneratorTypeDim    = "usage_based_dimension"
+	leafNodeTypePricePerUnit = "PricePerUnitLeafNode"
+
 	// Amberflo account-pricing GET/DELETE routes use query parameters, not
 	// path segments. Path-style URLs hit API Gateway without a matching
 	// route and return 403 "Missing Authentication Token".
@@ -189,15 +198,60 @@ type wireBillingPeriod struct {
 
 // wireProductPlan mirrors Amberflo's product-plan payload.
 type wireProductPlan struct {
-	ID                     string            `json:"id,omitempty"`
-	ProductID              string            `json:"productId,omitempty"`
-	ProductPlanName        string            `json:"productPlanName,omitempty"`
-	Description            string            `json:"description,omitempty"`
-	BillingPeriod          wireBillingPeriod `json:"billingPeriod"`
-	ProductItemPriceIdsMap map[string]string `json:"productItemPriceIdsMap,omitempty"`
+	ID                     string                 `json:"id,omitempty"`
+	ProductID              string                 `json:"productId,omitempty"`
+	ProductPlanName        string                 `json:"productPlanName,omitempty"`
+	Description            string                 `json:"description,omitempty"`
+	BillingPeriod          wireBillingPeriod      `json:"billingPeriod"`
+	ProductItemPriceIdsMap map[string]string      `json:"productItemPriceIdsMap,omitempty"`
 	FeeMap                 map[string]wirePlanFee `json:"feeMap,omitempty"`
-	LockingStatus          string            `json:"lockingStatus,omitempty"`
-	PlanCurrency           string            `json:"planCurrency,omitempty"`
+	LockingStatus          string                 `json:"lockingStatus,omitempty"`
+	PlanCurrency           string                 `json:"planCurrency,omitempty"`
+	Type                   string                 `json:"type,omitempty"`
+	IsDefault              *bool                  `json:"isDefault,omitempty"`
+	PlanGenerator          *wirePlanGenerator     `json:"planGenerator,omitempty"`
+}
+
+// wirePlanGenerator is the UI-facing product-plan generator. Amberflo's
+// Pricing page only lists plans that carry this block with
+// type=custom_pricing_plan.
+type wirePlanGenerator struct {
+	Type            string                 `json:"type"`
+	ID              string                 `json:"id,omitempty"`
+	BillingPeriod   wireBillingPeriod      `json:"billingPeriod"`
+	PlanName        string                 `json:"planName,omitempty"`
+	Description     string                 `json:"description,omitempty"`
+	LockingStatus   string                 `json:"lockingStatus,omitempty"`
+	IsDefault       *bool                  `json:"isDefault,omitempty"`
+	PlanCurrency    string                 `json:"planCurrency,omitempty"`
+	PriceGenerators []wirePriceGenerator   `json:"priceGenerators,omitempty"`
+	FeeMap          map[string]wirePlanFee `json:"feeMap,omitempty"`
+	RealTimePricing bool                   `json:"realTimePricing"`
+}
+
+// wirePriceGenerator is one usage price on a custom_pricing_plan.
+// PriceTiers is raw JSON because no-dimension generators use a flat
+// []PriceTier while dimension generators use grouped
+// {dimensionValues, priceTiers, leafNodeType} objects, both under the
+// same "priceTiers" key.
+type wirePriceGenerator struct {
+	ID                   string          `json:"id"`
+	Type                 string          `json:"type"`
+	ProductItemID        string          `json:"productItemId"`
+	ProductItemPriceName string          `json:"productItemPriceName,omitempty"`
+	LockingStatus        string          `json:"lockingStatus,omitempty"`
+	Scalar               float64         `json:"scalar,omitempty"`
+	LeafNodeType         string          `json:"leafNodeType,omitempty"`
+	DimensionKeys        []string        `json:"dimensionKeys,omitempty"`
+	PriceTiers           json.RawMessage `json:"priceTiers,omitempty"`
+}
+
+// wirePriceGeneratorGroup is one dimension-bucket entry for
+// usage_based_dimension generators.
+type wirePriceGeneratorGroup struct {
+	DimensionValues []string        `json:"dimensionValues,omitempty"`
+	PriceTiers      []wirePriceTier `json:"priceTiers,omitempty"`
+	LeafNodeType    string          `json:"leafNodeType"`
 }
 
 // GetProductPlan fetches a product plan by id.
@@ -241,7 +295,8 @@ func (c *client) EnsureProductPlan(ctx context.Context, desired DesiredProductPl
 	}
 
 	priceIDs := map[string]string{}
-	feeMap := map[string]wirePlanFee{}
+	var feeMap map[string]wirePlanFee
+	var generators []wirePriceGenerator
 
 	for i := range desired.Items {
 		item := &desired.Items[i]
@@ -280,7 +335,15 @@ func (c *client) EnsureProductPlan(ctx context.Context, desired DesiredProductPl
 				return ProductPlan{}, err
 			}
 			priceIDs[item.MeterAPIName] = priceID
+			gen, err := priceGeneratorFromMachine(priceID, item, price)
+			if err != nil {
+				return ProductPlan{}, &PermanentError{Err: fmt.Errorf("DesiredPlanItem %q: %w", item.ID, err)}
+			}
+			generators = append(generators, gen)
 		case PlanChargeTypeOneTime, PlanChargeTypeRecurring:
+			if feeMap == nil {
+				feeMap = map[string]wirePlanFee{}
+			}
 			feeMap[item.ID] = wirePlanFee{
 				Name:         firstNonEmpty(item.Label, item.ID),
 				Cost:         item.Amount,
@@ -291,19 +354,22 @@ func (c *client) EnsureProductPlan(ctx context.Context, desired DesiredProductPl
 		}
 	}
 
+	billingPeriod := wireBillingPeriod{
+		Interval:       "month",
+		IntervalsCount: 1,
+	}
 	want := wireProductPlan{
-		ID:              desired.ID,
-		ProductID:       productID,
-		ProductPlanName: desired.Name,
-		Description:     desired.Description,
-		BillingPeriod: wireBillingPeriod{
-			Interval:       "month",
-			IntervalsCount: 1,
-		},
+		ID:                     desired.ID,
+		ProductID:              productID,
+		ProductPlanName:        desired.Name,
+		Description:            desired.Description,
+		BillingPeriod:          billingPeriod,
 		ProductItemPriceIdsMap: priceIDs,
 		FeeMap:                 feeMap,
 		LockingStatus:          lockingStatusClose,
 		PlanCurrency:           currency,
+		Type:                   productPlanTypeCustom,
+		PlanGenerator:          buildPlanGenerator(desired, billingPeriod, currency, generators, feeMap, nil),
 	}
 
 	existing, err := c.GetProductPlan(ctx, desired.ID)
@@ -316,6 +382,12 @@ func (c *client) EnsureProductPlan(ctx context.Context, desired DesiredProductPl
 
 	var existingWire wireProductPlan
 	_ = json.Unmarshal(existing.Raw, &existingWire)
+	// Echo isDefault so a POST cannot unset the account default plan.
+	// Amberflo rejects that with "A default plan must be set."
+	want.IsDefault = existingWire.IsDefault
+	if want.PlanGenerator != nil {
+		want.PlanGenerator.IsDefault = existingWire.IsDefault
+	}
 	if !productPlanNeedsUpdate(existingWire, want) {
 		return existing, nil
 	}
@@ -459,10 +531,125 @@ func productPlanNeedsUpdate(existing, want wireProductPlan) bool {
 	if existing.LockingStatus != want.LockingStatus && want.LockingStatus != "" {
 		return true
 	}
+	if existing.Type != want.Type && want.Type != "" {
+		return true
+	}
 	if !reflect.DeepEqual(normalizeStringMap(existing.ProductItemPriceIdsMap), normalizeStringMap(want.ProductItemPriceIdsMap)) {
 		return true
 	}
-	return !reflect.DeepEqual(normalizeFeeMap(existing.FeeMap), normalizeFeeMap(want.FeeMap))
+	if !reflect.DeepEqual(normalizeFeeMap(existing.FeeMap), normalizeFeeMap(want.FeeMap)) {
+		return true
+	}
+	return !planGeneratorsEqual(existing.PlanGenerator, want.PlanGenerator)
+}
+
+func planGeneratorsEqual(a, b *wirePlanGenerator) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	if a.Type != b.Type || a.PlanName != b.PlanName || a.Description != b.Description {
+		return false
+	}
+	if !reflect.DeepEqual(normalizeFeeMap(a.FeeMap), normalizeFeeMap(b.FeeMap)) {
+		return false
+	}
+	if len(a.PriceGenerators) != len(b.PriceGenerators) {
+		return false
+	}
+	// Order is not semantically load-bearing; compare by product item id.
+	byItem := func(gens []wirePriceGenerator) map[string]wirePriceGenerator {
+		out := make(map[string]wirePriceGenerator, len(gens))
+		for _, g := range gens {
+			out[g.ProductItemID] = g
+		}
+		return out
+	}
+	am := byItem(a.PriceGenerators)
+	bm := byItem(b.PriceGenerators)
+	if len(am) != len(bm) {
+		return false
+	}
+	for id, ag := range am {
+		bg, ok := bm[id]
+		if !ok {
+			return false
+		}
+		if ag.Type != bg.Type || ag.ID != bg.ID || ag.LeafNodeType != bg.LeafNodeType {
+			return false
+		}
+		if !jsonEqual(ag.PriceTiers, bg.PriceTiers) {
+			return false
+		}
+		if !reflect.DeepEqual(ag.DimensionKeys, bg.DimensionKeys) {
+			return false
+		}
+	}
+	return true
+}
+
+func buildPlanGenerator(
+	desired DesiredProductPlan,
+	period wireBillingPeriod,
+	currency string,
+	generators []wirePriceGenerator,
+	feeMap map[string]wirePlanFee,
+	isDefault *bool,
+) *wirePlanGenerator {
+	return &wirePlanGenerator{
+		Type:            productPlanTypeCustom,
+		ID:              desired.ID,
+		BillingPeriod:   period,
+		PlanName:        desired.Name,
+		Description:     desired.Description,
+		LockingStatus:   lockingStatusClose,
+		IsDefault:       isDefault,
+		PlanCurrency:    currency,
+		PriceGenerators: generators,
+		FeeMap:          feeMap,
+	}
+}
+
+func priceGeneratorFromMachine(priceID string, item *DesiredPlanItem, price any) (wirePriceGenerator, error) {
+	gen := wirePriceGenerator{
+		ID:                   priceID,
+		ProductItemID:        item.MeterAPIName,
+		ProductItemPriceName: firstNonEmpty(item.Label, item.ID),
+		LockingStatus:        lockingStatusClose,
+		Scalar:               1,
+	}
+	switch p := price.(type) {
+	case wireLeafNode:
+		raw, err := json.Marshal(p.Tiers)
+		if err != nil {
+			return wirePriceGenerator{}, fmt.Errorf("encode no-dimension tiers: %w", err)
+		}
+		gen.Type = priceGeneratorTypeNoDim
+		gen.LeafNodeType = leafNodeTypePricePerUnit
+		gen.PriceTiers = raw
+		return gen, nil
+	case wireDimensionMatrixNode:
+		groups := make([]wirePriceGeneratorGroup, 0, len(p.DimensionsPrices))
+		for _, d := range p.DimensionsPrices {
+			groups = append(groups, wirePriceGeneratorGroup{
+				DimensionValues: d.DimensionValues,
+				PriceTiers:      d.LeafNode.Tiers,
+				LeafNodeType:    leafNodeTypePricePerUnit,
+			})
+		}
+		raw, err := json.Marshal(groups)
+		if err != nil {
+			return wirePriceGenerator{}, fmt.Errorf("encode dimension tiers: %w", err)
+		}
+		gen.Type = priceGeneratorTypeDim
+		gen.DimensionKeys = append([]string{}, p.DimensionKeys...)
+		gen.PriceTiers = raw
+		return gen, nil
+	default:
+		return wirePriceGenerator{}, fmt.Errorf("unsupported price machine %T", price)
+	}
 }
 
 func normalizeStringMap(in map[string]string) map[string]string {

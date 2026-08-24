@@ -86,6 +86,152 @@ func TestEnsureProductPlan_CreatesFlatUsage(t *testing.T) {
 	}
 }
 
+func TestEnsureProductPlan_CreatesCustomPlanGenerator(t *testing.T) {
+	c, f := newTestClient(t)
+	if _, err := c.EnsureProductPlan(context.Background(), baseDesiredProductPlan()); err != nil {
+		t.Fatalf("EnsureProductPlan: %v", err)
+	}
+
+	f.mu.Lock()
+	plan := f.productPlans["offer-uid-1"]
+	f.mu.Unlock()
+	if plan == nil {
+		t.Fatal("expected product plan stored")
+	}
+	if plan.Type != productPlanTypeCustom {
+		t.Errorf("Type=%q, want %q", plan.Type, productPlanTypeCustom)
+	}
+	if plan.PlanGenerator == nil {
+		t.Fatal("expected planGenerator")
+	}
+	if plan.PlanGenerator.Type != productPlanTypeCustom {
+		t.Errorf("planGenerator.Type=%q", plan.PlanGenerator.Type)
+	}
+	if plan.PlanGenerator.PlanName != "Compute Allocated v1" {
+		t.Errorf("planName=%q", plan.PlanGenerator.PlanName)
+	}
+	if len(plan.PlanGenerator.PriceGenerators) != 1 {
+		t.Fatalf("priceGenerators=%d", len(plan.PlanGenerator.PriceGenerators))
+	}
+	gen := plan.PlanGenerator.PriceGenerators[0]
+	if gen.Type != priceGeneratorTypeNoDim {
+		t.Errorf("generator type=%q", gen.Type)
+	}
+	if gen.ProductItemID != "meter-uid-cpu" {
+		t.Errorf("productItemId=%q", gen.ProductItemID)
+	}
+	if gen.LeafNodeType != leafNodeTypePricePerUnit {
+		t.Errorf("leafNodeType=%q", gen.LeafNodeType)
+	}
+	var tiers []wirePriceTier
+	if err := json.Unmarshal(gen.PriceTiers, &tiers); err != nil {
+		t.Fatalf("decode priceTiers: %v", err)
+	}
+	if len(tiers) != 1 || tiers[0].PricePerBatch != 0.025 {
+		t.Errorf("tiers=%+v", tiers)
+	}
+
+	for _, req := range f.requestsCopy() {
+		if req.Method != http.MethodPost || req.Path != productPlansPath {
+			continue
+		}
+		if !strings.Contains(string(req.Body), `"type":"custom_pricing_plan"`) {
+			t.Errorf("plan POST missing custom_pricing_plan: %s", req.Body)
+		}
+		if !strings.Contains(string(req.Body), `"planGenerator"`) {
+			t.Errorf("plan POST missing planGenerator: %s", req.Body)
+		}
+		return
+	}
+	t.Fatal("expected product plan POST")
+}
+
+func TestEnsureProductPlan_DimensionGenerator(t *testing.T) {
+	c, f := newTestClient(t)
+	desired := DesiredProductPlan{
+		ID:   "offer-dim",
+		Name: "AI",
+		Items: []DesiredPlanItem{{
+			ID:           "tokens",
+			ChargeType:   PlanChargeTypeUsage,
+			MeterAPIName: "meter-tokens",
+			Rates: []DesiredPlanRate{
+				{Match: &DimensionFilter{Dimension: "model", Value: "sonnet"}, Flat: floatPtr(0.000003)},
+				{Match: &DimensionFilter{Dimension: "model", Value: "opus"}, Flat: floatPtr(0.000015)},
+			},
+		}},
+	}
+	if _, err := c.EnsureProductPlan(context.Background(), desired); err != nil {
+		t.Fatalf("EnsureProductPlan: %v", err)
+	}
+	f.mu.Lock()
+	plan := f.productPlans["offer-dim"]
+	f.mu.Unlock()
+	if plan.PlanGenerator == nil || len(plan.PlanGenerator.PriceGenerators) != 1 {
+		t.Fatalf("generator=%+v", plan.PlanGenerator)
+	}
+	gen := plan.PlanGenerator.PriceGenerators[0]
+	if gen.Type != priceGeneratorTypeDim {
+		t.Errorf("type=%q", gen.Type)
+	}
+	if len(gen.DimensionKeys) != 1 || gen.DimensionKeys[0] != "model" {
+		t.Errorf("dimensionKeys=%v", gen.DimensionKeys)
+	}
+}
+
+func TestEnsureProductPlan_BackfillsGeneratorOnExistingPlan(t *testing.T) {
+	c, f := newTestClient(t)
+	desired := baseDesiredProductPlan()
+	if _, err := c.EnsureProductPlan(context.Background(), desired); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	f.mu.Lock()
+	plan := f.productPlans["offer-uid-1"]
+	plan.Type = ""
+	plan.PlanGenerator = nil
+	f.mu.Unlock()
+
+	if _, err := c.EnsureProductPlan(context.Background(), desired); err != nil {
+		t.Fatalf("backfill: %v", err)
+	}
+	f.mu.Lock()
+	updated := f.productPlans["offer-uid-1"]
+	f.mu.Unlock()
+	if updated.Type != productPlanTypeCustom {
+		t.Errorf("Type=%q", updated.Type)
+	}
+	if updated.PlanGenerator == nil {
+		t.Fatal("expected planGenerator after backfill")
+	}
+}
+
+func TestEnsureProductPlan_PreservesDefaultFlag(t *testing.T) {
+	c, f := newTestClient(t)
+	desired := baseDesiredProductPlan()
+	desired.Name = "Renamed"
+	if _, err := c.EnsureProductPlan(context.Background(), baseDesiredProductPlan()); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	trueVal := true
+	f.mu.Lock()
+	f.productPlans["offer-uid-1"].IsDefault = &trueVal
+	f.mu.Unlock()
+
+	if _, err := c.EnsureProductPlan(context.Background(), desired); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	f.mu.Lock()
+	plan := f.productPlans["offer-uid-1"]
+	f.mu.Unlock()
+	if plan.IsDefault == nil || !*plan.IsDefault {
+		t.Errorf("isDefault=%v, want true", plan.IsDefault)
+	}
+	if plan.ProductPlanName != "Renamed" {
+		t.Errorf("name=%q", plan.ProductPlanName)
+	}
+}
+
 func TestEnsureProductPlan_CreatesProductItemName(t *testing.T) {
 	c, f := newTestClient(t)
 	if _, err := c.EnsureProductPlan(context.Background(), baseDesiredProductPlan()); err != nil {
