@@ -86,6 +86,23 @@ func TestEnsureProductPlan_CreatesFlatUsage(t *testing.T) {
 	}
 }
 
+func TestEnsureProductPlan_CreatesProductItemName(t *testing.T) {
+	c, f := newTestClient(t)
+	if _, err := c.EnsureProductPlan(context.Background(), baseDesiredProductPlan()); err != nil {
+		t.Fatalf("EnsureProductPlan: %v", err)
+	}
+	for _, req := range f.requestsCopy() {
+		if req.Method != http.MethodPost || req.Path != productItemsPath {
+			continue
+		}
+		if !strings.Contains(string(req.Body), `"productItemName"`) {
+			t.Fatalf("product item POST missing productItemName: %s", req.Body)
+		}
+		return
+	}
+	t.Fatal("expected product item POST")
+}
+
 func TestEnsureProductPlan_TieredGraduated(t *testing.T) {
 	c, _ := newTestClient(t)
 	desired := DesiredProductPlan{
@@ -244,6 +261,34 @@ func TestDeleteProductPlan_RemovesExisting(t *testing.T) {
 	counts := methodCounts(f.requestsCopy())
 	if counts[http.MethodDelete] != 1 {
 		t.Errorf("expected 1 DELETE, got %#v", counts)
+	}
+}
+
+func TestEnsureProductPlan_GetUsesQueryParams(t *testing.T) {
+	c, f := newTestClient(t)
+	if _, err := c.EnsureProductPlan(context.Background(), baseDesiredProductPlan()); err != nil {
+		t.Fatalf("EnsureProductPlan: %v", err)
+	}
+
+	for _, req := range f.requestsCopy() {
+		if req.Method != http.MethodGet {
+			continue
+		}
+		switch req.Path {
+		case productPlansPath:
+			if req.Query != "productPlanId=offer-uid-1" {
+				t.Errorf("product plan GET query=%q, want productPlanId=offer-uid-1", req.Query)
+			}
+		case productItemsPath:
+			if req.Query != "productItemId=meter-uid-cpu" {
+				t.Errorf("product item GET query=%q, want productItemId=meter-uid-cpu", req.Query)
+			}
+		case productItemPricePath:
+			wantID := productItemPriceID("offer-uid-1", "cpu-allocated")
+			if req.Query != "id="+wantID {
+				t.Errorf("product item price GET query=%q, want id=%s", req.Query, wantID)
+			}
+		}
 	}
 }
 

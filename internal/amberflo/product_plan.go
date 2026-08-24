@@ -34,7 +34,18 @@ const (
 	priceMachineLeafNode  = "LeafNode"
 	priceMachineDimMatrix = "DimensionMatrixNode"
 	lockingStatusClose    = "close_to_changes"
+
+	// Amberflo account-pricing GET/DELETE routes use query parameters, not
+	// path segments. Path-style URLs hit API Gateway without a matching
+	// route and return 403 "Missing Authentication Token".
+	productPlanIDQueryParam      = "productPlanId"
+	productItemIDQueryParam      = "productItemId"
+	productItemPriceIDQueryParam = "id"
 )
+
+func accountPricingQueryPath(basePath, param, value string) string {
+	return basePath + "?" + param + "=" + url.QueryEscape(value)
+}
 
 // PlanChargeType distinguishes Usage vs fixed plan items.
 type PlanChargeType string
@@ -121,10 +132,10 @@ type ProductPlan struct {
 
 // wireProductItem mirrors Amberflo's product-item payload.
 type wireProductItem struct {
-	ID           string `json:"id"`
-	Name         string `json:"name,omitempty"`
-	MeterAPIName string `json:"meterApiName,omitempty"`
-	ProductID    string `json:"productId,omitempty"`
+	ID              string `json:"id"`
+	ProductItemName string `json:"productItemName,omitempty"`
+	MeterAPIName    string `json:"meterApiName,omitempty"`
+	ProductID       string `json:"productId,omitempty"`
 }
 
 // wirePriceTier is one LeafNode tier on the wire.
@@ -194,7 +205,7 @@ func (c *client) GetProductPlan(ctx context.Context, id string) (ProductPlan, er
 	if id == "" {
 		return ProductPlan{}, &PermanentError{Err: errors.New("product plan id is required")}
 	}
-	path := productPlansPath + "/" + url.PathEscape(id)
+	path := accountPricingQueryPath(productPlansPath, productPlanIDQueryParam, id)
 	var wp wireProductPlan
 	_, body, err := c.doJSON(ctx, http.MethodGet, path, nil, &wp)
 	if err != nil {
@@ -243,10 +254,10 @@ func (c *client) EnsureProductPlan(ctx context.Context, desired DesiredProductPl
 				return ProductPlan{}, &PermanentError{Err: fmt.Errorf("DesiredPlanItem %q: MeterAPIName is required for usage", item.ID)}
 			}
 			if err := c.ensureProductItem(ctx, wireProductItem{
-				ID:           item.MeterAPIName,
-				Name:         firstNonEmpty(item.Label, item.MeterAPIName),
-				MeterAPIName: item.MeterAPIName,
-				ProductID:    productID,
+				ID:              item.MeterAPIName,
+				ProductItemName: firstNonEmpty(item.Label, item.MeterAPIName),
+				MeterAPIName:    item.MeterAPIName,
+				ProductID:       productID,
 			}); err != nil {
 				return ProductPlan{}, err
 			}
@@ -349,7 +360,7 @@ func (c *client) DeleteProductPlan(ctx context.Context, id string) error {
 		}
 	}
 
-	path := productPlansPath + "/" + url.PathEscape(id)
+	path := accountPricingQueryPath(productPlansPath, productPlanIDQueryParam, id)
 	_, _, err = c.doJSON(ctx, http.MethodDelete, path, nil, nil)
 	if err != nil {
 		var perm *PermanentError
@@ -362,30 +373,40 @@ func (c *client) DeleteProductPlan(ctx context.Context, id string) error {
 }
 
 func (c *client) ensureProductItem(ctx context.Context, item wireProductItem) error {
-	path := productItemsPath + "/" + url.PathEscape(item.ID)
-	_, _, err := c.doJSON(ctx, http.MethodGet, path, nil, &wireProductItem{})
-	if err == nil {
+	if item.ID == "" {
+		return &PermanentError{Err: errors.New("product item id is required")}
+	}
+	path := accountPricingQueryPath(productItemsPath, productItemIDQueryParam, item.ID)
+	var got wireProductItem
+	_, _, err := c.doJSON(ctx, http.MethodGet, path, nil, &got)
+	if err == nil && got.ID != "" {
 		return nil
 	}
-	var perm *PermanentError
-	if !errors.As(err, &perm) || perm.StatusCode != http.StatusNotFound {
-		return err
+	if err != nil {
+		var perm *PermanentError
+		if !errors.As(err, &perm) || perm.StatusCode != http.StatusNotFound {
+			return err
+		}
 	}
 	_, _, err = c.doJSON(ctx, http.MethodPost, productItemsPath, item, nil)
 	return err
 }
 
 func (c *client) ensureProductItemPrice(ctx context.Context, price wireProductItemPrice) error {
-	path := productItemPricePath + "/" + url.PathEscape(price.ID)
+	path := accountPricingQueryPath(productItemPricePath, productItemPriceIDQueryParam, price.ID)
 	var existing wireProductItemPrice
 	_, _, err := c.doJSON(ctx, http.MethodGet, path, nil, &existing)
-	switch err {
-	case nil:
+	switch {
+	case err == nil && existing.ID != "":
 		if existing.ProductItemID == price.ProductItemID &&
 			existing.ProductItemPriceName == price.ProductItemPriceName &&
 			jsonEqual(existing.Price, price.Price) {
 			return nil
 		}
+		_, _, err = c.doJSON(ctx, http.MethodPost, productItemPricePath, price, nil)
+		return err
+	case err == nil:
+		// Amberflo returns 200 with a null body when the price is absent.
 		_, _, err = c.doJSON(ctx, http.MethodPost, productItemPricePath, price, nil)
 		return err
 	default:
