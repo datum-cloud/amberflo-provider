@@ -18,13 +18,17 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"net/url"
 	"time"
 )
 
 const (
 	customerPricingPath     = "/payments/pricing/amberflo/customer-pricing"
 	customerPricingListPath = "/payments/pricing/amberflo/customer-pricing/list"
+
+	// Amberflo's customer-pricing list GET expects CustomerId (PascalCase).
+	// Lowercase customerId is ignored and returns 400 "CustomerId must be
+	// populated", the same class of query-param mismatch as product-plans.
+	customerIDQueryParam = "CustomerId"
 )
 
 // DesiredCustomerPlan is the controller-facing representation of an
@@ -76,7 +80,7 @@ func (c *client) ListCustomerPlans(ctx context.Context, customerID string) ([]Cu
 	if customerID == "" {
 		return nil, &PermanentError{Err: errors.New("customerID is required")}
 	}
-	path := customerPricingListPath + "?customerId=" + url.QueryEscape(customerID)
+	path := accountPricingQueryPath(customerPricingListPath, customerIDQueryParam, customerID)
 	var wire []wireCustomerProductPlan
 	_, body, err := c.doJSON(ctx, http.MethodGet, path, nil, &wire)
 	if err != nil {
