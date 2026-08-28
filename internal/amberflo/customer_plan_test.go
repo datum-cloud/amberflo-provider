@@ -16,6 +16,7 @@ package amberflo
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -133,4 +134,24 @@ func TestEnsureCustomerPlan_EmptyIDsPermanent(t *testing.T) {
 	if _, err := c.EnsureCustomerPlan(context.Background(), DesiredCustomerPlan{}); !IsPermanent(err) {
 		t.Fatalf("expected permanent, got %v", err)
 	}
+}
+
+func TestListCustomerPlans_UsesCustomerIdQueryParam(t *testing.T) {
+	c, f := newTestClient(t)
+	if _, err := c.ListCustomerPlans(context.Background(), "ba-uid"); err != nil {
+		t.Fatalf("ListCustomerPlans: %v", err)
+	}
+	for _, req := range f.requestsCopy() {
+		if req.Method != http.MethodGet || req.Path != customerPricingListPath {
+			continue
+		}
+		if !strings.Contains(req.Query, "CustomerId=ba-uid") {
+			t.Fatalf("list query = %q, want CustomerId=ba-uid", req.Query)
+		}
+		if strings.Contains(req.Query, "customerId=ba-uid") {
+			t.Fatalf("list query must not use lowercase customerId: %q", req.Query)
+		}
+		return
+	}
+	t.Fatal("expected customer-pricing list GET")
 }

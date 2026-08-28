@@ -643,7 +643,10 @@ func (f *fakeServer) servePricing(w http.ResponseWriter, r *http.Request, body [
 		return true
 
 	case r.Method == http.MethodGet && r.URL.Path == customerPricingListPath:
-		customerID := r.URL.Query().Get("customerId")
+		customerID := r.URL.Query().Get("CustomerId")
+		if customerID == "" {
+			customerID = r.URL.Query().Get("customerId")
+		}
 		f.mu.Lock()
 		out := append([]wireCustomerProductPlan(nil), f.customerPlans[customerID]...)
 		f.mu.Unlock()
