@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
 	"reflect"
 	"slices"
 	"strings"
@@ -168,8 +169,10 @@ func TestEnsureMeter_NoopWhenEqual(t *testing.T) {
 	if counts[http.MethodPost] != 0 || counts[http.MethodPut] != 0 {
 		t.Errorf("expected no writes, got POST=%d PUT=%d", counts[http.MethodPost], counts[http.MethodPut])
 	}
-	if counts[http.MethodGet] != 1 {
-		t.Errorf("expected 1 GET, got %d", counts[http.MethodGet])
+	// GET /meters plus GET product-items/list so a leftover item can
+	// be retargeted after a previous create-without-billing.
+	if counts[http.MethodGet] != 2 {
+		t.Errorf("expected 2 GETs, got %d", counts[http.MethodGet])
 	}
 }
 
@@ -297,6 +300,459 @@ func TestEnsureMeter_EmptyMeterTypeIsPermanent(t *testing.T) {
 	}
 }
 
+func TestEnsureMeter_AdoptsOnLabelCollision(t *testing.T) {
+	c, f := newTestClient(t)
+	legacy := storedFromDesired(baseDesiredMeter())
+	legacy.MeterAPIName = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	legacy.ID = "fake-id-" + legacy.MeterAPIName
+	legacy.Label = "CPU Seconds"
+	f.seedMeter(legacy)
+
+	d := baseDesiredMeter()
+	d.APIName = "cpu-seconds"
+	got, err := c.EnsureMeter(context.Background(), d)
+	if err != nil {
+		t.Fatalf("EnsureMeter: %v", err)
+	}
+	if got.APIName != "cpu-seconds" {
+		t.Errorf("APIName=%q, want cpu-seconds", got.APIName)
+	}
+	if got.ID == legacy.ID {
+		t.Errorf("expected a new Amberflo server id after delete+create, still %q", got.ID)
+	}
+	if _, ok := f.fetchMeter(legacy.MeterAPIName); ok {
+		t.Error("expected leftover UID-keyed meter to be deleted")
+	}
+	if stored, ok := f.fetchMeter("cpu-seconds"); !ok || stored.Label != "CPU Seconds (cpu-seconds)" {
+		t.Errorf("replacement meter missing under unique label: ok=%v stored=%+v", ok, stored)
+	}
+
+	counts := methodCounts(f.requestsCopy())
+	if counts[http.MethodPost] != 2 {
+		t.Errorf("expected 2 POSTs (rejected create, then recreate), got %d", counts[http.MethodPost])
+	}
+	if counts[http.MethodDelete] != 1 {
+		t.Errorf("expected 1 DELETE of leftover meter, got %d", counts[http.MethodDelete])
+	}
+}
+
+func TestEnsureMeter_RejectsForeignLabelCollision(t *testing.T) {
+	c, f := newTestClient(t)
+	other := storedFromDesired(baseDesiredMeter())
+	other.MeterAPIName = "someone-elses-meter"
+	other.Label = "CPU Seconds"
+	f.seedMeter(other)
+
+	d := baseDesiredMeter()
+	d.APIName = "cpu-seconds"
+	_, err := c.EnsureMeter(context.Background(), d)
+	if err == nil || !IsPermanent(err) {
+		t.Fatalf("expected PermanentError, got %v", err)
+	}
+	if _, ok := f.fetchMeter("someone-elses-meter"); !ok {
+		t.Error("foreign meter should be left in place")
+	}
+}
+
+func TestEnsureMeter_RetargetsOrphanDeprecatedProductItem(t *testing.T) {
+	c, f := newTestClient(t)
+	f.seedProductItem(wireProductItem{
+		ID:              "item-alb-requests",
+		ProductItemName: "CPU Seconds",
+		MeterAPIName:    "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+		ProductID:       "1",
+		LockingStatus:   lockingStatusDeprecated,
+	})
+	f.seedProductPlan(wireProductPlan{
+		ID:              "payg-v1",
+		ProductPlanName: "Pay As You Go",
+		ProductItemPriceIdsMap: map[string]string{
+			"item-alb-requests": "payg-v1--alb-requests",
+		},
+	})
+
+	d := baseDesiredMeter()
+	d.APIName = "cpu-seconds"
+	got, err := c.EnsureMeter(context.Background(), d)
+	if err != nil {
+		t.Fatalf("EnsureMeter: %v", err)
+	}
+	if got.APIName != "cpu-seconds" {
+		t.Errorf("APIName=%q, want cpu-seconds", got.APIName)
+	}
+	item, ok := f.fetchProductItem("item-alb-requests")
+	if !ok {
+		t.Fatal("expected leftover product item to be kept")
+	}
+	if item.MeterAPIName != "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" {
+		t.Errorf("immutable leftover meterApiName=%q, want original UID", item.MeterAPIName)
+	}
+	if item.LockingStatus != lockingStatusDeprecated {
+		t.Errorf("leftover lockingStatus=%q, want deprecated", item.LockingStatus)
+	}
+	stored, ok := f.fetchMeter("cpu-seconds")
+	if !ok || stored.Label != "CPU Seconds (cpu-seconds)" {
+		t.Errorf("replacement meter missing under unique label: ok=%v stored=%+v", ok, stored)
+	}
+	if stored.UseInBilling {
+		t.Error("expected POST without useInBilling so Amberflo does not mint a second product item")
+	}
+
+	var postedWithoutBilling bool
+	for _, req := range f.requestsCopy() {
+		if req.Method == http.MethodPost && req.Path == "/meters" &&
+			strings.Contains(string(req.Body), `"useInBilling":false`) {
+			postedWithoutBilling = true
+		}
+		if req.Method == http.MethodDelete && strings.Contains(req.Path, "product-items") {
+			t.Fatal("must not DELETE a plan-attached product item")
+		}
+	}
+	if !postedWithoutBilling {
+		t.Error("expected a meter POST with useInBilling=false")
+	}
+}
+
+func TestEnsureMeter_RetargetsOrphanOpenProductItem(t *testing.T) {
+	c, f := newTestClient(t)
+	f.seedProductItem(wireProductItem{
+		ID:              "item-uptime",
+		ProductItemName: "CPU Seconds",
+		MeterAPIName:    "c031ea42-b516-4f2c-bbb4-b0dee4299f35",
+		ProductID:       "1",
+		LockingStatus:   lockingStatusActive,
+	})
+
+	d := baseDesiredMeter()
+	d.APIName = "cpu-seconds"
+	if _, err := c.EnsureMeter(context.Background(), d); err != nil {
+		t.Fatalf("EnsureMeter: %v", err)
+	}
+	item, ok := f.fetchProductItem("item-uptime")
+	if !ok {
+		t.Fatal("expected leftover product item to be kept")
+	}
+	if item.MeterAPIName != "cpu-seconds" {
+		t.Errorf("product item meterApiName=%q, want cpu-seconds", item.MeterAPIName)
+	}
+}
+
+func TestEnsureMeter_AdoptsOrphanProductItemWhenMeterAlreadyExists(t *testing.T) {
+	c, f := newTestClient(t)
+	existing := storedFromDesired(baseDesiredMeter())
+	existing.MeterAPIName = "cpu-seconds"
+	existing.ID = "fake-id-cpu-seconds"
+	f.seedMeter(existing)
+	f.seedProductItem(wireProductItem{
+		ID:              "item-alb-requests",
+		ProductItemName: "CPU Seconds",
+		MeterAPIName:    "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+		ProductID:       "1",
+		LockingStatus:   lockingStatusActive,
+	})
+
+	d := baseDesiredMeter()
+	d.APIName = "cpu-seconds"
+	if _, err := c.EnsureMeter(context.Background(), d); err != nil {
+		t.Fatalf("EnsureMeter: %v", err)
+	}
+	item, ok := f.fetchProductItem("item-alb-requests")
+	if !ok {
+		t.Fatal("expected leftover product item to be kept")
+	}
+	if item.MeterAPIName != "cpu-seconds" {
+		t.Errorf("product item meterApiName=%q, want cpu-seconds", item.MeterAPIName)
+	}
+}
+
+func TestEnsureMeter_RejectsProductItemWithLiveMeter(t *testing.T) {
+	c, f := newTestClient(t)
+	live := storedFromDesired(baseDesiredMeter())
+	live.MeterAPIName = "someone-elses-meter"
+	live.Label = "Other Label"
+	live.ID = "fake-id-" + live.MeterAPIName
+	f.seedMeter(live)
+	f.seedProductItem(wireProductItem{
+		ID:              "item-foreign",
+		ProductItemName: "CPU Seconds",
+		MeterAPIName:    live.MeterAPIName,
+		ProductID:       "1",
+		LockingStatus:   lockingStatusActive,
+	})
+
+	d := baseDesiredMeter()
+	d.APIName = "cpu-seconds"
+	_, err := c.EnsureMeter(context.Background(), d)
+	if err == nil || !IsPermanent(err) {
+		t.Fatalf("expected PermanentError, got %v", err)
+	}
+	if _, ok := f.fetchProductItem("item-foreign"); !ok {
+		t.Error("foreign product item should be left in place")
+	}
+	if _, ok := f.fetchMeter(live.MeterAPIName); !ok {
+		t.Error("live meter should be left in place")
+	}
+}
+
+func TestEnsureMeter_PostsUniqueLabelWhenGETByLabelMisses(t *testing.T) {
+	c, f := newTestClient(t)
+	f.occupyLabel("CPU Seconds")
+
+	d := baseDesiredMeter()
+	d.APIName = "cpu-seconds"
+	got, err := c.EnsureMeter(context.Background(), d)
+	if err != nil {
+		t.Fatalf("EnsureMeter: %v", err)
+	}
+	if got.APIName != "cpu-seconds" {
+		t.Errorf("APIName=%q, want cpu-seconds", got.APIName)
+	}
+	if got.Label != "CPU Seconds (cpu-seconds)" {
+		t.Errorf("Label=%q, want disambiguated form", got.Label)
+	}
+	stored, ok := f.fetchMeter("cpu-seconds")
+	if !ok {
+		t.Fatal("expected meter under stable meterApiName")
+	}
+	if stored.UseInBilling {
+		t.Error("expected POST without useInBilling")
+	}
+
+	var originalLabelPosts, uniqueLabelPosts int
+	for _, req := range f.requestsCopy() {
+		if req.Method != http.MethodPost || req.Path != "/meters" {
+			continue
+		}
+		body := string(req.Body)
+		switch {
+		case strings.Contains(body, `"label":"CPU Seconds (cpu-seconds)"`):
+			uniqueLabelPosts++
+		case strings.Contains(body, `"label":"CPU Seconds"`):
+			originalLabelPosts++
+		}
+	}
+	if originalLabelPosts != 1 {
+		t.Errorf("expected 1 initial POST with original label, got %d", originalLabelPosts)
+	}
+	if uniqueLabelPosts != 1 {
+		t.Errorf("expected 1 POST with unique label after GET miss, got %d", uniqueLabelPosts)
+	}
+}
+
+func TestEnsureMeter_DoesNotRewriteDisambiguatedLabel(t *testing.T) {
+	c, f := newTestClient(t)
+	existing := storedFromDesired(baseDesiredMeter())
+	existing.MeterAPIName = "cpu-seconds"
+	existing.ID = "fake-id-cpu-seconds"
+	existing.Label = "CPU Seconds (cpu-seconds)"
+	f.seedMeter(existing)
+	f.occupyLabel("CPU Seconds")
+
+	d := baseDesiredMeter()
+	d.APIName = "cpu-seconds"
+	if _, err := c.EnsureMeter(context.Background(), d); err != nil {
+		t.Fatalf("EnsureMeter: %v", err)
+	}
+	if got := methodCounts(f.requestsCopy())[http.MethodPut]; got != 0 {
+		t.Errorf("expected no PUT rewriting unique label back to occupied original, got %d", got)
+	}
+	stored, _ := f.fetchMeter("cpu-seconds")
+	if stored.Label != "CPU Seconds (cpu-seconds)" {
+		t.Errorf("Label=%q", stored.Label)
+	}
+}
+
+func TestEnsureMeter_PreservesDisambiguatedLabelOnOtherDrift(t *testing.T) {
+	c, f := newTestClient(t)
+	existing := storedFromDesired(baseDesiredMeter())
+	existing.MeterAPIName = "cpu-seconds"
+	existing.ID = "fake-id-cpu-seconds"
+	existing.Label = "CPU Seconds (cpu-seconds)"
+	existing.Unit = "ms"
+	f.seedMeter(existing)
+	f.occupyLabel("CPU Seconds")
+
+	d := baseDesiredMeter()
+	d.APIName = "cpu-seconds"
+	if _, err := c.EnsureMeter(context.Background(), d); err != nil {
+		t.Fatalf("EnsureMeter: %v", err)
+	}
+	stored, _ := f.fetchMeter("cpu-seconds")
+	if stored.Label != "CPU Seconds (cpu-seconds)" {
+		t.Errorf("Label=%q, PUT must not restore the occupied original", stored.Label)
+	}
+	if stored.Unit != "s" {
+		t.Errorf("Unit=%q, want s", stored.Unit)
+	}
+}
+
+func TestEnsureMeter_CreatesWhenLeftoverHasInvalidLongMeterAPIName(t *testing.T) {
+	c, f := newTestClient(t)
+	longName := "assistant-miloapis-com-conversation-cache-read-tokens"
+	f.seedProductItem(wireProductItem{
+		ID:              longName,
+		ProductItemName: "Cached prompt tokens",
+		MeterAPIName:    longName,
+		ProductID:       "1",
+		LockingStatus:   "open",
+	})
+
+	d := baseDesiredMeter()
+	d.APIName = longName
+	d.Label = "Cached prompt tokens"
+	got, err := c.EnsureMeter(context.Background(), d)
+	if err != nil {
+		t.Fatalf("EnsureMeter: %v", err)
+	}
+	want := MeterAPIName(longName)
+	if got.APIName != want {
+		t.Errorf("APIName=%q, want hashed %q", got.APIName, want)
+	}
+}
+
+func TestEnsureMeter_HashesAPINameWhenTooLong(t *testing.T) {
+	c, f := newTestClient(t)
+	d := baseDesiredMeter()
+	d.APIName = strings.Repeat("a", maxMeterAPINameLen+1)
+	got, err := c.EnsureMeter(context.Background(), d)
+	if err != nil {
+		t.Fatalf("EnsureMeter: %v", err)
+	}
+	want := MeterAPIName(d.APIName)
+	if got.APIName != want {
+		t.Errorf("APIName=%q, want hashed %q", got.APIName, want)
+	}
+	if len(got.APIName) > maxMeterAPINameLen {
+		t.Errorf("hashed APIName length %d exceeds %d", len(got.APIName), maxMeterAPINameLen)
+	}
+	if _, ok := f.fetchMeter(want); !ok {
+		t.Error("expected meter stored under hashed meterApiName")
+	}
+}
+
+func TestMeterAPIName_PassThroughAndHash(t *testing.T) {
+	short := "networking-datumapis-com-gateway-requests"
+	if got := MeterAPIName(short); got != short {
+		t.Errorf("short name: got %q want %q", got, short)
+	}
+	long := "networking-datumapis-com-gateway-connection-seconds"
+	if len(long) <= maxMeterAPINameLen {
+		t.Fatalf("fixture %q is not longer than %d", long, maxMeterAPINameLen)
+	}
+	got := MeterAPIName(long)
+	if len(got) != 40 {
+		t.Errorf("hashed length=%d, want 40", len(got))
+	}
+	if got == long {
+		t.Error("expected long name to be hashed")
+	}
+	if MeterAPIName(long) != got {
+		t.Error("hash must be stable")
+	}
+	other := MeterAPIName("assistant-miloapis-com-conversation-cache-read-tokens")
+	if other == got {
+		t.Error("distinct long names must hash differently")
+	}
+}
+
+func TestDisambiguatedMeterLabel_FitsCap(t *testing.T) {
+	got := disambiguatedMeterLabel("ALB Requests", "networking-datumapis-com-gateway-requests")
+	if got != "ALB Requests (networking-datumapis-com-gateway-requests)" {
+		t.Errorf("got %q", got)
+	}
+	longLabel := strings.Repeat("x", maxMeterLabelLen)
+	got = disambiguatedMeterLabel(longLabel, "cpu-seconds")
+	if len(got) > maxMeterLabelLen {
+		t.Errorf("length %d exceeds %d: %q", len(got), maxMeterLabelLen, got)
+	}
+	if !strings.HasSuffix(got, " (cpu-seconds)") {
+		t.Errorf("expected truncated label to keep apiName suffix, got %q", got)
+	}
+}
+
+func TestGetMeterByLabel_ExactMatch(t *testing.T) {
+	c, f := newTestClient(t)
+	f.seedMeter(storedFromDesired(baseDesiredMeter()))
+	got, err := c.GetMeterByLabel(context.Background(), "CPU Seconds")
+	if err != nil {
+		t.Fatalf("GetMeterByLabel: %v", err)
+	}
+	if got.APIName != "uid-cpu-1" {
+		t.Errorf("APIName=%q", got.APIName)
+	}
+
+	reqs := f.requestsCopy()
+	if len(reqs) != 1 {
+		t.Fatalf("expected 1 GET, got %d", len(reqs))
+	}
+	if reqs[0].Method != http.MethodGet || reqs[0].Path != "/meters" {
+		t.Errorf("got %s %s", reqs[0].Method, reqs[0].Path)
+	}
+	q, err := url.ParseQuery(reqs[0].Query)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if got := q.Get("label"); got != "CPU Seconds" {
+		t.Errorf("label query=%q, want CPU Seconds", got)
+	}
+}
+
+func TestGetMeterByLabel_NotFound(t *testing.T) {
+	c, _ := newTestClient(t)
+	_, err := c.GetMeterByLabel(context.Background(), "missing")
+	if !errors.Is(err, ErrMeterNotFound) {
+		t.Errorf("expected ErrMeterNotFound, got %v", err)
+	}
+}
+
+func TestGetMeterByLabel_MultipleMatchesArePermanent(t *testing.T) {
+	c, f := newTestClient(t)
+	a := storedFromDesired(baseDesiredMeter())
+	a.MeterAPIName = "meter-a"
+	a.Label = "Shared"
+	b := storedFromDesired(baseDesiredMeter())
+	b.MeterAPIName = "meter-b"
+	b.Label = "Shared"
+	f.seedMeter(a)
+	f.seedMeter(b)
+
+	_, err := c.GetMeterByLabel(context.Background(), "Shared")
+	if err == nil || !IsPermanent(err) {
+		t.Fatalf("expected PermanentError, got %v", err)
+	}
+}
+
+func TestDeleteMeter_FallsBackToLegacyUIDByLabel(t *testing.T) {
+	c, f := newTestClient(t)
+	legacy := storedFromDesired(baseDesiredMeter())
+	legacy.MeterAPIName = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	legacy.ID = "fake-id-" + legacy.MeterAPIName
+	legacy.Label = "CPU Seconds"
+	f.seedMeter(legacy)
+
+	if err := c.DeleteMeter(context.Background(), "cpu-seconds", "CPU Seconds"); err != nil {
+		t.Fatalf("DeleteMeter: %v", err)
+	}
+	if _, ok := f.fetchMeter(legacy.MeterAPIName); ok {
+		t.Error("expected leftover UID-keyed meter to be deleted")
+	}
+}
+
+func TestDeleteMeter_DoesNotDeleteForeignLabelMatch(t *testing.T) {
+	c, f := newTestClient(t)
+	other := storedFromDesired(baseDesiredMeter())
+	other.MeterAPIName = "someone-elses-meter"
+	other.Label = "CPU Seconds"
+	f.seedMeter(other)
+
+	if err := c.DeleteMeter(context.Background(), "cpu-seconds", "CPU Seconds"); err != nil {
+		t.Fatalf("DeleteMeter: %v", err)
+	}
+	if _, ok := f.fetchMeter("someone-elses-meter"); !ok {
+		t.Error("foreign meter should be left in place")
+	}
+}
+
 func TestGetMeter_HappyPath(t *testing.T) {
 	c, f := newTestClient(t)
 	f.seedMeter(storedFromDesired(baseDesiredMeter()))
@@ -369,7 +825,7 @@ func TestDeleteMeter_HappyPath_DeprecatesThenDeletesByServerID(t *testing.T) {
 	c, f := newTestClient(t)
 	f.seedMeter(storedFromDesired(baseDesiredMeter()))
 
-	if err := c.DeleteMeter(context.Background(), "uid-cpu-1"); err != nil {
+	if err := c.DeleteMeter(context.Background(), "uid-cpu-1", ""); err != nil {
 		t.Fatalf("DeleteMeter: %v", err)
 	}
 	if _, ok := f.fetchMeter("uid-cpu-1"); ok {
@@ -409,7 +865,7 @@ func TestDeleteMeter_SkipsDeprecateWhenAlreadyDeprecated(t *testing.T) {
 	seed.LockingStatus = "deprecated"
 	f.seedMeter(seed)
 
-	if err := c.DeleteMeter(context.Background(), "uid-cpu-1"); err != nil {
+	if err := c.DeleteMeter(context.Background(), "uid-cpu-1", ""); err != nil {
 		t.Fatalf("DeleteMeter: %v", err)
 	}
 	// Only GET + DELETE. No PUT — the guard saves a round-trip when
@@ -454,7 +910,7 @@ func TestDeleteMeter_NotFoundTolerated(t *testing.T) {
 	c, f := newTestClient(t)
 	// Nothing seeded — GET returns []; DeleteMeter must treat that as
 	// success so the reconciler's finalizer release path is idempotent.
-	if err := c.DeleteMeter(context.Background(), "does-not-exist"); err != nil {
+	if err := c.DeleteMeter(context.Background(), "does-not-exist", ""); err != nil {
 		t.Fatalf("DeleteMeter on missing meter: want nil, got %v", err)
 	}
 	// Only the GET probe runs — no DELETE since we never resolved an id.
@@ -475,7 +931,7 @@ func TestDeleteMeter_DoesNotUseMeterAPINameAsDeletePathKey(t *testing.T) {
 	c, f := newTestClient(t)
 	f.seedMeter(storedFromDesired(baseDesiredMeter()))
 
-	if err := c.DeleteMeter(context.Background(), "uid-cpu-1"); err != nil {
+	if err := c.DeleteMeter(context.Background(), "uid-cpu-1", ""); err != nil {
 		t.Fatalf("DeleteMeter: %v", err)
 	}
 	for _, r := range f.requestsCopy() {
@@ -491,7 +947,7 @@ func TestDeleteMeter_DoesNotUseMeterAPINameAsDeletePathKey(t *testing.T) {
 func TestDeleteMeter_TransientOn5xx(t *testing.T) {
 	c, f := newTestClient(t)
 	f.armFailures(503, 10, 0)
-	err := c.DeleteMeter(context.Background(), "uid-cpu-1")
+	err := c.DeleteMeter(context.Background(), "uid-cpu-1", "")
 	if err == nil {
 		t.Fatalf("expected error")
 	}
@@ -502,7 +958,7 @@ func TestDeleteMeter_TransientOn5xx(t *testing.T) {
 
 func TestDeleteMeter_EmptyAPINameIsPermanent(t *testing.T) {
 	c, _ := newTestClient(t)
-	err := c.DeleteMeter(context.Background(), "")
+	err := c.DeleteMeter(context.Background(), "", "")
 	if err == nil || !IsPermanent(err) {
 		t.Fatalf("expected PermanentError, got %v", err)
 	}
@@ -532,6 +988,12 @@ func TestMeterNeedsUpdate_FieldMatrix(t *testing.T) {
 	// Equal shapes are a no-op.
 	if meterNeedsUpdate(base, want) {
 		t.Errorf("equal shapes should not need update")
+	}
+
+	disambiguated := base
+	disambiguated.Label = disambiguatedMeterLabel(want.Label, want.MeterAPIName)
+	if meterNeedsUpdate(disambiguated, want) {
+		t.Errorf("disambiguated label should not need update")
 	}
 
 	// Each field that should trigger an update.

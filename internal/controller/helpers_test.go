@@ -21,6 +21,8 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+
+	"go.miloapis.com/amberflo-provider/internal/amberflo"
 )
 
 var _ = Describe("amberfloMeterType", func() {
@@ -51,7 +53,7 @@ var _ = Describe("amberfloMeterType", func() {
 })
 
 var _ = Describe("desiredMeterFromDefinition", func() {
-	It("maps spec fields onto DesiredMeter with UID-derived APIName", func() {
+	It("maps spec fields onto DesiredMeter with metadata.name APIName", func() {
 		md := &billingv1alpha1.MeterDefinition{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: "cpu-seconds",
@@ -71,7 +73,7 @@ var _ = Describe("desiredMeterFromDefinition", func() {
 			},
 		}
 		got := desiredMeterFromDefinition(md, "sum_of_all_usage")
-		Expect(got.APIName).To(Equal("uid-cpu"))
+		Expect(got.APIName).To(Equal("cpu-seconds"))
 		Expect(got.Label).To(Equal("CPU Seconds"))
 		Expect(got.MeterType).To(Equal("sum_of_all_usage"))
 		Expect(got.Unit).To(Equal("s"))
@@ -123,6 +125,26 @@ var _ = Describe("desiredMeterFromDefinition", func() {
 		got := desiredMeterFromDefinition(md, "sum_of_all_usage")
 		Expect(got.Label).To(Equal("compute.miloapis.com/fallback"))
 		Expect(got.Dimensions).To(BeNil())
+	})
+	It("hashes metadata.name when it exceeds Amberflo's 50-char meterApiName limit", func() {
+		name := "networking-datumapis-com-gateway-connection-seconds"
+		md := &billingv1alpha1.MeterDefinition{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: name,
+				UID:  types.UID("uid-long"),
+			},
+			Spec: billingv1alpha1.MeterDefinitionSpec{
+				MeterName:   "networking.datumapis.com/gateway.connection-seconds",
+				DisplayName: "ALB Connection Seconds",
+				Measurement: billingv1alpha1.MeterMeasurement{
+					Unit: "s",
+				},
+			},
+		}
+		got := desiredMeterFromDefinition(md, "sum_of_all_usage")
+		Expect(got.APIName).To(Equal(amberflo.MeterAPIName(name)))
+		Expect(len(got.APIName)).To(BeNumerically("<=", 50))
+		Expect(got.APIName).NotTo(Equal(name))
 	})
 })
 

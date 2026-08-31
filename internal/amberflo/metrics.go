@@ -112,9 +112,9 @@ func (ic *InstrumentedClient) EnsureMeter(ctx context.Context, desired DesiredMe
 }
 
 // DeleteMeter forwards to the wrapped client while recording metrics.
-func (ic *InstrumentedClient) DeleteMeter(ctx context.Context, meterAPIName string) error {
+func (ic *InstrumentedClient) DeleteMeter(ctx context.Context, meterAPIName, label string) error {
 	start := time.Now()
-	err := ic.Client.DeleteMeter(ctx, meterAPIName)
+	err := ic.Client.DeleteMeter(ctx, meterAPIName, label)
 	recordOp("DeleteMeter", start, err)
 	return err
 }
@@ -124,6 +124,14 @@ func (ic *InstrumentedClient) GetMeter(ctx context.Context, meterAPIName string)
 	start := time.Now()
 	out, err := ic.Client.GetMeter(ctx, meterAPIName)
 	recordOp("GetMeter", start, err)
+	return out, err
+}
+
+// GetMeterByLabel forwards to the wrapped client while recording metrics.
+func (ic *InstrumentedClient) GetMeterByLabel(ctx context.Context, label string) (Meter, error) {
+	start := time.Now()
+	out, err := ic.Client.GetMeterByLabel(ctx, label)
+	recordOp("GetMeterByLabel", start, err)
 	return out, err
 }
 

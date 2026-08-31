@@ -19,33 +19,35 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	billingv1alpha1 "go.miloapis.com/billing/api/v1alpha1"
+
+	"go.miloapis.com/amberflo-provider/internal/amberflo"
 )
 
 // makeMeterDefinition is a test helper that constructs a MeterDefinition with
-// the given name, UID, and phase.
-func makeMeterDefinition(name string, uid types.UID, phase billingv1alpha1.Phase) *billingv1alpha1.MeterDefinition {
+// the given resource name, UID, meter name, and phase.
+func makeMeterDefinition(resourceName string, uid types.UID, meterName string, phase billingv1alpha1.Phase) *billingv1alpha1.MeterDefinition {
 	md := &billingv1alpha1.MeterDefinition{}
-	md.Name = name
+	md.Name = resourceName
 	md.UID = uid
-	md.Spec.MeterName = name
+	md.Spec.MeterName = meterName
 	md.Spec.Phase = phase
 	return md
 }
 
 // TestMeterDefinitionCache_PublishedIsIndexed verifies that a MeterDefinition
-// in the Published phase is reachable via GetUID.
+// in the Published phase is reachable via GetAPIName.
 func TestMeterDefinitionCache_PublishedIsIndexed(t *testing.T) {
-	mc := &MeterDefinitionCache{uidByMeterName: make(map[string]types.UID)}
-	md := makeMeterDefinition("compute.miloapis.com/cpu", "uid-published", billingv1alpha1.PhasePublished)
+	mc := &MeterDefinitionCache{apiNameByMeterName: make(map[string]string)}
+	md := makeMeterDefinition("networking-datumapis-com-gateway-requests", "uid-published", "networking.datumapis.com/gateway.requests", billingv1alpha1.PhasePublished)
 
 	mc.upsert(md)
 
-	uid, ok := mc.GetUID("compute.miloapis.com/cpu")
+	apiName, ok := mc.GetAPIName("networking.datumapis.com/gateway.requests")
 	if !ok {
 		t.Fatal("expected Published meter to be found in cache")
 	}
-	if uid != "uid-published" {
-		t.Errorf("UID: got %q want %q", uid, "uid-published")
+	if apiName != "networking-datumapis-com-gateway-requests" {
+		t.Errorf("APIName: got %q want %q", apiName, "networking-datumapis-com-gateway-requests")
 	}
 }
 
@@ -53,12 +55,12 @@ func TestMeterDefinitionCache_PublishedIsIndexed(t *testing.T) {
 // in the Deprecated phase is also reachable (events for deprecated meters must
 // still be submittable until the meter is removed entirely).
 func TestMeterDefinitionCache_DeprecatedIsIndexed(t *testing.T) {
-	mc := &MeterDefinitionCache{uidByMeterName: make(map[string]types.UID)}
-	md := makeMeterDefinition("compute.miloapis.com/mem", "uid-deprecated", billingv1alpha1.PhaseDeprecated)
+	mc := &MeterDefinitionCache{apiNameByMeterName: make(map[string]string)}
+	md := makeMeterDefinition("compute-miloapis-com-mem", "uid-deprecated", "compute.miloapis.com/mem", billingv1alpha1.PhaseDeprecated)
 
 	mc.upsert(md)
 
-	_, ok := mc.GetUID("compute.miloapis.com/mem")
+	_, ok := mc.GetAPIName("compute.miloapis.com/mem")
 	if !ok {
 		t.Error("expected Deprecated meter to be found in cache")
 	}
@@ -68,12 +70,12 @@ func TestMeterDefinitionCache_DeprecatedIsIndexed(t *testing.T) {
 // that is not Published or Deprecated is excluded from the index so that
 // events for not-yet-active meters are nacked rather than forwarded to Amberflo.
 func TestMeterDefinitionCache_DraftIsNotIndexed(t *testing.T) {
-	mc := &MeterDefinitionCache{uidByMeterName: make(map[string]types.UID)}
-	md := makeMeterDefinition("compute.miloapis.com/gpu", "uid-draft", billingv1alpha1.PhaseDraft)
+	mc := &MeterDefinitionCache{apiNameByMeterName: make(map[string]string)}
+	md := makeMeterDefinition("compute-miloapis-com-gpu", "uid-draft", "compute.miloapis.com/gpu", billingv1alpha1.PhaseDraft)
 
 	mc.upsert(md)
 
-	_, ok := mc.GetUID("compute.miloapis.com/gpu")
+	_, ok := mc.GetAPIName("compute.miloapis.com/gpu")
 	if ok {
 		t.Error("expected Draft meter NOT to be found in cache")
 	}
@@ -82,16 +84,16 @@ func TestMeterDefinitionCache_DraftIsNotIndexed(t *testing.T) {
 // TestMeterDefinitionCache_DeleteRemovesEntry verifies that deleting a
 // MeterDefinition removes it from the index.
 func TestMeterDefinitionCache_DeleteRemovesEntry(t *testing.T) {
-	mc := &MeterDefinitionCache{uidByMeterName: make(map[string]types.UID)}
-	md := makeMeterDefinition("compute.miloapis.com/net", "uid-net", billingv1alpha1.PhasePublished)
+	mc := &MeterDefinitionCache{apiNameByMeterName: make(map[string]string)}
+	md := makeMeterDefinition("compute-miloapis-com-net", "uid-net", "compute.miloapis.com/net", billingv1alpha1.PhasePublished)
 
 	mc.upsert(md)
-	if _, ok := mc.GetUID("compute.miloapis.com/net"); !ok {
+	if _, ok := mc.GetAPIName("compute.miloapis.com/net"); !ok {
 		t.Fatal("expected meter to be present before delete")
 	}
 
 	mc.delete(md)
-	if _, ok := mc.GetUID("compute.miloapis.com/net"); ok {
+	if _, ok := mc.GetAPIName("compute.miloapis.com/net"); ok {
 		t.Error("expected meter to be absent after delete")
 	}
 }
@@ -101,18 +103,37 @@ func TestMeterDefinitionCache_DeleteRemovesEntry(t *testing.T) {
 // removes it from the index (the upsert call handles the transition to
 // non-indexed phases by calling delete internally).
 func TestMeterDefinitionCache_TransitionToNonIndexedPhaseRemovesEntry(t *testing.T) {
-	mc := &MeterDefinitionCache{uidByMeterName: make(map[string]types.UID)}
+	mc := &MeterDefinitionCache{apiNameByMeterName: make(map[string]string)}
 
-	published := makeMeterDefinition("compute.miloapis.com/disk", "uid-disk", billingv1alpha1.PhasePublished)
+	published := makeMeterDefinition("compute-miloapis-com-disk", "uid-disk", "compute.miloapis.com/disk", billingv1alpha1.PhasePublished)
 	mc.upsert(published)
-	if _, ok := mc.GetUID("compute.miloapis.com/disk"); !ok {
+	if _, ok := mc.GetAPIName("compute.miloapis.com/disk"); !ok {
 		t.Fatal("expected Published meter to be present")
 	}
 
 	// Transition to Draft — should be evicted.
-	draft := makeMeterDefinition("compute.miloapis.com/disk", "uid-disk", billingv1alpha1.PhaseDraft)
+	draft := makeMeterDefinition("compute-miloapis-com-disk", "uid-disk", "compute.miloapis.com/disk", billingv1alpha1.PhaseDraft)
 	mc.upsert(draft)
-	if _, ok := mc.GetUID("compute.miloapis.com/disk"); ok {
+	if _, ok := mc.GetAPIName("compute.miloapis.com/disk"); ok {
 		t.Error("expected meter to be removed after transitioning to Draft phase")
+	}
+}
+
+func TestMeterDefinitionCache_ShortensLongAPIName(t *testing.T) {
+	mc := &MeterDefinitionCache{apiNameByMeterName: make(map[string]string)}
+	name := "networking-datumapis-com-gateway-connection-seconds"
+	md := makeMeterDefinition(name, "uid-long", "networking.datumapis.com/gateway.connection-seconds", billingv1alpha1.PhasePublished)
+	mc.upsert(md)
+
+	apiName, ok := mc.GetAPIName("networking.datumapis.com/gateway.connection-seconds")
+	if !ok {
+		t.Fatal("expected Published meter to be found in cache")
+	}
+	want := amberflo.MeterAPIName(name)
+	if apiName != want {
+		t.Errorf("APIName: got %q want %q", apiName, want)
+	}
+	if len(apiName) > 50 {
+		t.Errorf("cached APIName length %d exceeds Amberflo limit", len(apiName))
 	}
 }

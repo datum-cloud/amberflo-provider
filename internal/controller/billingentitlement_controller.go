@@ -52,8 +52,8 @@ const (
 type BillingEntitlementReconciler struct {
 	client.Client
 	AmberfloClient amberflo.Client
-	Recorder      record.EventRecorder
-	Log           logr.Logger
+	Recorder       record.EventRecorder
+	Log            logr.Logger
 }
 
 // +kubebuilder:rbac:groups=billing.miloapis.com,resources=billingentitlements,verbs=get;list;watch;update;patch
@@ -294,11 +294,12 @@ func (r *BillingEntitlementReconciler) handleAmberfloError(
 ) (ctrl.Result, error) {
 	switch {
 	case amberflo.IsPermanent(err):
-		logger.Error(err, "Amberflo EnsureCustomerPlan permanent failure")
+		logger.Error(err, "Amberflo EnsureCustomerPlan permanent failure; requeueing",
+			"requeueAfter", permanentDisableRequeueAfter.String())
 		if r.Recorder != nil {
 			r.Recorder.Eventf(be, "Warning", EventReasonSyncFailed, "%s: %v", syncReasonPermanent, err)
 		}
-		return ctrl.Result{}, nil
+		return ctrl.Result{RequeueAfter: permanentDisableRequeueAfter}, nil
 	case amberflo.IsTransient(err):
 		logger.Info("Amberflo EnsureCustomerPlan transient failure; requeueing",
 			"err", err.Error(), "requeueAfter", transientRequeueAfter.String())

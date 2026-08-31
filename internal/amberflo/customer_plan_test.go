@@ -35,7 +35,7 @@ func TestEnsureCustomerPlan_CreatesWhenAbsent(t *testing.T) {
 	if got.CustomerID != "ba-uid" || got.ProductPlanID != "offer-uid" {
 		t.Errorf("got=%+v", got)
 	}
-	if got.StartTimeInSeconds != 1_700_000_000 {
+	if got.StartTimeInSeconds != 1_700_000_000+int64(customerPlanTimeSkew/time.Second) {
 		t.Errorf("start=%d", got.StartTimeInSeconds)
 	}
 	counts := methodCounts(f.requestsCopy())
@@ -117,7 +117,7 @@ func TestCancelCustomerPlan_EndsAssignment(t *testing.T) {
 	f.mu.Lock()
 	plans := f.customerPlans["ba-uid"]
 	f.mu.Unlock()
-	if len(plans) != 1 || plans[0].EndTimeInSeconds != 1_700_000_000 {
+	if len(plans) != 1 || plans[0].EndTimeInSeconds != 1_700_000_000+int64(customerPlanTimeSkew/time.Second) {
 		t.Fatalf("expected ended plan, got %+v", plans)
 	}
 }
@@ -125,6 +125,21 @@ func TestCancelCustomerPlan_EndsAssignment(t *testing.T) {
 func TestCancelCustomerPlan_ToleratesMissing(t *testing.T) {
 	c, _ := newTestClient(t)
 	if err := c.CancelCustomerPlan(context.Background(), "ba-uid", "missing"); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+}
+
+func TestCancelCustomerPlan_RetriesWhenEndTimeInPast(t *testing.T) {
+	c, f := newTestClient(t, func(co *ClientOptions) {
+		co.now = func() time.Time { return time.Unix(1_700_000_000, 0).UTC() }
+	})
+	f.customerPlanNow = 1_700_000_000 + int64(customerPlanTimeSkew/time.Second)
+	if _, err := c.EnsureCustomerPlan(context.Background(), DesiredCustomerPlan{
+		CustomerID: "ba-uid", ProductPlanID: "offer-uid",
+	}); err != nil {
+		t.Fatalf("assign: %v", err)
+	}
+	if err := c.CancelCustomerPlan(context.Background(), "ba-uid", "offer-uid"); err != nil {
 		t.Fatalf("cancel: %v", err)
 	}
 }

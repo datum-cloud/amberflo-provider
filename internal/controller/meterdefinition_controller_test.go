@@ -85,15 +85,15 @@ func waitForMeterGone(key client.ObjectKey) {
 }
 
 // waitForMeterInFake polls until the fake has a stored meter under the
-// given MeterDefinition UID.
+// given MeterDefinition metadata.name.
 func waitForMeterInFake(key client.ObjectKey, predicate func(storedMeter) bool) storedMeter {
 	GinkgoHelper()
 	var last storedMeter
 	Eventually(func(g Gomega) {
 		var md billingv1alpha1.MeterDefinition
 		g.Expect(k8sClient.Get(ctx, key, &md)).To(Succeed())
-		m, ok := fakeHTTP.FetchMeter(string(md.UID))
-		g.Expect(ok).To(BeTrue(), "no meter yet for UID=%s", md.UID)
+		m, ok := fakeHTTP.FetchMeter(md.Name)
+		g.Expect(ok).To(BeTrue(), "no meter yet for apiName=%s", md.Name)
 		if predicate != nil {
 			g.Expect(predicate(m)).To(BeTrue(), "predicate not satisfied; m=%+v", m)
 		}
@@ -255,7 +255,7 @@ var _ = Describe("MeterDefinitionReconciler", func() {
 
 			// Simulate the meter being gone out-of-band before the
 			// reconciler issues its DELETE.
-			Expect(fakeHTTP.DeleteMeter(string(fresh.UID))).To(BeTrue())
+			Expect(fakeHTTP.DeleteMeter(fresh.Name)).To(BeTrue())
 
 			Expect(k8sClient.Delete(ctx, md)).To(Succeed())
 			waitForMeterGone(meterKey(md.Name))

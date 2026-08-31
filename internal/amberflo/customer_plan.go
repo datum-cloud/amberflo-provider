@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -29,6 +30,11 @@ const (
 	// Lowercase customerId is ignored and returns 400 "CustomerId must be
 	// populated", the same class of query-param mismatch as product-plans.
 	customerIDQueryParam = "CustomerId"
+
+	// customerPlanTimeSkew keeps start/end timestamps strictly in
+	// Amberflo's future. Posting now.Unix() 400s with "end time can't
+	// be in the past" when the provider clock is a second behind.
+	customerPlanTimeSkew = 30 * time.Second
 )
 
 // DesiredCustomerPlan is the controller-facing representation of an
@@ -113,7 +119,7 @@ func (c *client) EnsureCustomerPlan(ctx context.Context, desired DesiredCustomer
 	now := c.now().UTC()
 	start := desired.StartTime
 	if start.IsZero() {
-		start = now
+		start = now.Add(customerPlanTimeSkew)
 	}
 
 	existing, err := c.ListCustomerPlans(ctx, desired.CustomerID)
@@ -147,8 +153,7 @@ func (c *client) EnsureCustomerPlan(ctx context.Context, desired DesiredCustomer
 		CustomerID:         desired.CustomerID,
 		StartTimeInSeconds: start.Unix(),
 	}
-	var got wireCustomerProductPlan
-	_, body, err := c.doJSON(ctx, http.MethodPost, customerPricingPath, payload, &got)
+	got, body, err := c.postCustomerPlan(ctx, payload)
 	if err != nil {
 		return CustomerPlan{}, err
 	}
@@ -159,7 +164,9 @@ func (c *client) EnsureCustomerPlan(ctx context.Context, desired DesiredCustomer
 }
 
 // CancelCustomerPlan ends the customer's assignment to productPlanID by
-// posting an update with endTimeInSeconds=now. Missing assignments succeed.
+// posting an update with endTimeInSeconds a few seconds in the future
+// so Amberflo does not reject the timestamp as already past. Missing
+// assignments succeed.
 func (c *client) CancelCustomerPlan(ctx context.Context, customerID, productPlanID string) error {
 	if customerID == "" {
 		return &PermanentError{Err: errors.New("customerID is required")}
@@ -197,11 +204,10 @@ func (c *client) CancelCustomerPlan(ctx context.Context, customerID, productPlan
 			ProductPlanID:      productPlanID,
 			CustomerID:         customerID,
 			StartTimeInSeconds: start,
-			EndTimeInSeconds:   now.Unix(),
+			EndTimeInSeconds:   now.Add(customerPlanTimeSkew).Unix(),
 			RelationID:         cp.RelationID,
 		}
-		_, _, err := c.doJSON(ctx, http.MethodPost, customerPricingPath, payload, nil)
-		if err != nil {
+		if _, _, err := c.postCustomerPlan(ctx, payload); err != nil {
 			return err
 		}
 	}
@@ -210,6 +216,33 @@ func (c *client) CancelCustomerPlan(ctx context.Context, customerID, productPlan
 		return nil
 	}
 	return nil
+}
+
+func (c *client) postCustomerPlan(ctx context.Context, payload wireCustomerProductPlan) (wireCustomerProductPlan, []byte, error) {
+	var got wireCustomerProductPlan
+	_, body, err := c.doJSON(ctx, http.MethodPost, customerPricingPath, payload, &got)
+	if err == nil || !isCustomerPlanEndInPastError(err) {
+		return got, body, err
+	}
+	if payload.EndTimeInSeconds > 0 {
+		payload.EndTimeInSeconds += int64(time.Minute / time.Second)
+	} else {
+		payload.StartTimeInSeconds += int64(time.Minute / time.Second)
+	}
+	_, body, err = c.doJSON(ctx, http.MethodPost, customerPricingPath, payload, &got)
+	return got, body, err
+}
+
+func isCustomerPlanEndInPastError(err error) bool {
+	var perm *PermanentError
+	if !errors.As(err, &perm) {
+		return false
+	}
+	msg := perm.ResponseBody
+	if msg == "" && perm.Err != nil {
+		msg = perm.Err.Error()
+	}
+	return strings.Contains(msg, "end time can't be in the past")
 }
 
 func customerPlanFromWire(w wireCustomerProductPlan, raw []byte) CustomerPlan {

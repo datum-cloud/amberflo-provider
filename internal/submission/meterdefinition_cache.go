@@ -18,26 +18,27 @@ import (
 	"fmt"
 	"sync"
 
-	"k8s.io/apimachinery/pkg/types"
 	toolscache "k8s.io/client-go/tools/cache"
 	runtimecache "sigs.k8s.io/controller-runtime/pkg/cache"
 
 	billingv1alpha1 "go.miloapis.com/billing/api/v1alpha1"
+
+	"go.miloapis.com/amberflo-provider/internal/amberflo"
 )
 
-// MeterDefinitionCache maintains a thread-safe in-memory index of
-// MeterDefinition UIDs keyed by spec.meterName. Only Published and Deprecated
-// meters are indexed; entries in other phases are removed.
+// MeterDefinitionCache maintains a thread-safe in-memory index of stable
+// Amberflo meterApiName values keyed by spec.meterName. Only Published and
+// Deprecated meters are indexed; entries in other phases are removed.
 type MeterDefinitionCache struct {
-	mu             sync.RWMutex
-	uidByMeterName map[string]types.UID
+	mu                 sync.RWMutex
+	apiNameByMeterName map[string]string
 }
 
 // NewMeterDefinitionCache registers event handlers on the MeterDefinition
 // informer and returns a cache ready to use once the manager cache syncs.
 func NewMeterDefinitionCache(ctx context.Context, c runtimecache.Cache) (*MeterDefinitionCache, error) {
 	mc := &MeterDefinitionCache{
-		uidByMeterName: make(map[string]types.UID),
+		apiNameByMeterName: make(map[string]string),
 	}
 
 	informer, err := c.GetInformer(ctx, &billingv1alpha1.MeterDefinition{})
@@ -77,21 +78,22 @@ func (m *MeterDefinitionCache) upsert(md *billingv1alpha1.MeterDefinition) {
 		return
 	}
 	m.mu.Lock()
-	m.uidByMeterName[md.Spec.MeterName] = md.UID
+	m.apiNameByMeterName[md.Spec.MeterName] = amberflo.MeterAPIName(md.Name)
 	m.mu.Unlock()
 }
 
 func (m *MeterDefinitionCache) delete(md *billingv1alpha1.MeterDefinition) {
 	m.mu.Lock()
-	delete(m.uidByMeterName, md.Spec.MeterName)
+	delete(m.apiNameByMeterName, md.Spec.MeterName)
 	m.mu.Unlock()
 }
 
-// GetUID returns the UID of the MeterDefinition with the given meter name, or
-// false if not found or not in Published/Deprecated phase.
-func (m *MeterDefinitionCache) GetUID(meterName string) (types.UID, bool) {
+// GetAPIName returns the Amberflo meterApiName for the MeterDefinition with
+// the given meter name, or false if not found or not in Published/Deprecated
+// phase.
+func (m *MeterDefinitionCache) GetAPIName(meterName string) (string, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	uid, ok := m.uidByMeterName[meterName]
-	return uid, ok
+	apiName, ok := m.apiNameByMeterName[meterName]
+	return apiName, ok
 }

@@ -69,14 +69,20 @@ type Client interface {
 	// calls with the same DesiredMeter are no-ops after the first.
 	EnsureMeter(ctx context.Context, desired DesiredMeter) (Meter, error)
 
-	// DeleteMeter removes the meter identified by meterAPIName. 404s are
+	// DeleteMeter removes the meter identified by meterAPIName. When
+	// the name lookup misses, label is used to find a leftover
+	// UID-keyed meter from before names were stable. 404s are
 	// tolerated as success so the reconciler can cleanly finalize a
 	// MeterDefinition whose Amberflo counterpart is already gone.
-	DeleteMeter(ctx context.Context, meterAPIName string) error
+	DeleteMeter(ctx context.Context, meterAPIName, label string) error
 
 	// GetMeter fetches the current meter record. Returns ErrMeterNotFound
 	// on 404.
 	GetMeter(ctx context.Context, meterAPIName string) (Meter, error)
+
+	// GetMeterByLabel fetches a meter by its unique display label. Returns
+	// ErrMeterNotFound when no meter has that label.
+	GetMeterByLabel(ctx context.Context, label string) (Meter, error)
 
 	// SubmitUsage posts usage records to the Amberflo ingest API.
 	// Returns nil on 2xx. Returns *TransientError on 5xx/429/network.
