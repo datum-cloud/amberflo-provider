@@ -438,6 +438,251 @@ func TestEnsureProductPlan_GetUsesQueryParams(t *testing.T) {
 	}
 }
 
+func TestEnsureProductPlan_ReusesLeftoverItemByDisplayName(t *testing.T) {
+	c, f := newTestClient(t)
+	const leftoverID = "3e421f8e-5c58-4598-abbc-7372f3a21539"
+	f.seedProductItem(wireProductItem{
+		ID:              leftoverID,
+		ProductItemName: "CPU Allocated",
+		MeterAPIName:    "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+		ProductID:       "1",
+		LockingStatus:   lockingStatusActive,
+	})
+
+	if _, err := c.EnsureProductPlan(context.Background(), baseDesiredProductPlan()); err != nil {
+		t.Fatalf("EnsureProductPlan: %v", err)
+	}
+
+	item, ok := f.fetchProductItem(leftoverID)
+	if !ok {
+		t.Fatal("expected leftover product item to be kept")
+	}
+	if item.MeterAPIName != "meter-uid-cpu" {
+		t.Errorf("meterApiName=%q, want meter-uid-cpu", item.MeterAPIName)
+	}
+	if _, created := f.fetchProductItem("meter-uid-cpu"); created {
+		t.Error("must not POST a second product item keyed by meterApiName")
+	}
+
+	f.mu.Lock()
+	plan := f.productPlans["offer-uid-1"]
+	f.mu.Unlock()
+	if plan == nil {
+		t.Fatal("expected product plan stored")
+	}
+	priceID := productItemPriceID("offer-uid-1", "cpu-allocated")
+	if plan.ProductItemPriceIdsMap[leftoverID] != priceID {
+		t.Errorf("price map=%v, want leftover UUID key", plan.ProductItemPriceIdsMap)
+	}
+	if _, keyedByAPIName := plan.ProductItemPriceIdsMap["meter-uid-cpu"]; keyedByAPIName {
+		t.Error("must not key productItemPriceIdsMap by meterApiName when reusing a UUID item")
+	}
+	if plan.PlanGenerator == nil || len(plan.PlanGenerator.PriceGenerators) != 1 {
+		t.Fatalf("generator=%+v", plan.PlanGenerator)
+	}
+	if plan.PlanGenerator.PriceGenerators[0].ProductItemID != leftoverID {
+		t.Errorf("generator productItemId=%q, want leftover UUID", plan.PlanGenerator.PriceGenerators[0].ProductItemID)
+	}
+}
+
+func TestEnsureProductPlan_AdoptsLeftoverWithInvalidLongMeterAPIName(t *testing.T) {
+	c, f := newTestClient(t)
+	longName := "assistant-miloapis-com-conversation-cache-read-tokens"
+	hashed := MeterAPIName(longName)
+	f.seedProductItem(wireProductItem{
+		ID:              longName,
+		ProductItemName: "Cached prompt tokens",
+		MeterAPIName:    longName,
+		ProductID:       "1",
+		LockingStatus:   "open",
+	})
+	desired := DesiredProductPlan{
+		ID:   "offer-cache",
+		Name: "PAYG 3",
+		Items: []DesiredPlanItem{{
+			ID:           "cache-read",
+			Label:        "Cached prompt tokens",
+			ChargeType:   PlanChargeTypeUsage,
+			MeterAPIName: hashed,
+			Rates:        []DesiredPlanRate{flatRate(0.001)},
+		}},
+	}
+	if _, err := c.EnsureProductPlan(context.Background(), desired); err != nil {
+		t.Fatalf("EnsureProductPlan: %v", err)
+	}
+}
+
+func TestEnsureProductPlan_MintsUniqueItemWhenLeftoverDeprecated(t *testing.T) {
+	c, f := newTestClient(t)
+	const leftoverID = "3e421f8e-5c58-4598-abbc-7372f3a21539"
+	f.seedProductItem(wireProductItem{
+		ID:              leftoverID,
+		ProductItemName: "CPU Allocated",
+		MeterAPIName:    "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+		ProductID:       "1",
+		LockingStatus:   lockingStatusDeprecated,
+	})
+
+	if _, err := c.EnsureProductPlan(context.Background(), baseDesiredProductPlan()); err != nil {
+		t.Fatalf("EnsureProductPlan: %v", err)
+	}
+
+	leftover, ok := f.fetchProductItem(leftoverID)
+	if !ok {
+		t.Fatal("expected leftover product item to be kept")
+	}
+	if leftover.MeterAPIName != "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" {
+		t.Errorf("immutable leftover meterApiName=%q", leftover.MeterAPIName)
+	}
+
+	created, ok := f.fetchProductItem("meter-uid-cpu")
+	if !ok {
+		t.Fatal("expected a new product item keyed by meterApiName")
+	}
+	wantName := disambiguatedMeterLabel("CPU Allocated", "meter-uid-cpu")
+	if created.ProductItemName != wantName {
+		t.Errorf("productItemName=%q, want %q", created.ProductItemName, wantName)
+	}
+	if created.MeterAPIName != "meter-uid-cpu" {
+		t.Errorf("new item meterApiName=%q", created.MeterAPIName)
+	}
+
+	f.mu.Lock()
+	plan := f.productPlans["offer-uid-1"]
+	f.mu.Unlock()
+	priceID := productItemPriceID("offer-uid-1", "cpu-allocated")
+	if plan.ProductItemPriceIdsMap["meter-uid-cpu"] != priceID {
+		t.Errorf("price map=%v, want meterApiName key", plan.ProductItemPriceIdsMap)
+	}
+}
+
+func TestEnsureProductPlan_ReusesUUIDSiblingOnSameMeter(t *testing.T) {
+	c, f := newTestClient(t)
+	const leftoverID = "3e421f8e-5c58-4598-abbc-7372f3a21539"
+	const siblingID = "dd14562d-46cf-4ace-b1e9-38e6d1089ac4"
+	f.seedProductItem(wireProductItem{
+		ID:              leftoverID,
+		ProductItemName: "CPU Allocated",
+		MeterAPIName:    "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+		ProductID:       "1",
+		LockingStatus:   lockingStatusDeprecated,
+	})
+	f.seedProductItem(wireProductItem{
+		ID:              siblingID,
+		ProductItemName: disambiguatedMeterLabel("CPU Allocated", "meter-uid-cpu"),
+		MeterAPIName:    "meter-uid-cpu",
+		ProductID:       "1",
+		LockingStatus:   lockingStatusClose,
+	})
+
+	if _, err := c.EnsureProductPlan(context.Background(), baseDesiredProductPlan()); err != nil {
+		t.Fatalf("EnsureProductPlan: %v", err)
+	}
+
+	if _, created := f.fetchProductItem("meter-uid-cpu"); created {
+		t.Error("must not POST a third product item keyed by meterApiName")
+	}
+	f.mu.Lock()
+	plan := f.productPlans["offer-uid-1"]
+	f.mu.Unlock()
+	priceID := productItemPriceID("offer-uid-1", "cpu-allocated")
+	if plan == nil || plan.ProductItemPriceIdsMap[siblingID] != priceID {
+		t.Errorf("price map=%v, want sibling UUID key", plan.ProductItemPriceIdsMap)
+	}
+}
+
+func TestEnsureProductPlan_MintsUniquePriceWhenLeftoverNameExists(t *testing.T) {
+	c, f := newTestClient(t)
+	const leftoverItemID = "b0daf6b1-e724-45ce-9b01-a96a79d2c479"
+	const leftoverPriceID = "payg-v1-compute-vcpu-price"
+	f.seedProductItem(wireProductItem{
+		ID:              leftoverItemID,
+		ProductItemName: "CPU Allocated",
+		MeterAPIName:    leftoverItemID,
+		ProductID:       "1",
+		LockingStatus:   lockingStatusClose,
+	})
+	f.seedProductItemPrice(wireProductItemPrice{
+		ID:                   leftoverPriceID,
+		ProductItemID:        leftoverItemID,
+		ProductItemPriceName: "CPU Allocated",
+		LockingStatus:        lockingStatusClose,
+	})
+
+	if _, err := c.EnsureProductPlan(context.Background(), baseDesiredProductPlan()); err != nil {
+		t.Fatalf("EnsureProductPlan: %v", err)
+	}
+
+	priceID := productItemPriceID("offer-uid-1", "cpu-allocated")
+	f.mu.Lock()
+	price := f.itemPrices[priceID]
+	leftover := f.itemPrices[leftoverPriceID]
+	plan := f.productPlans["offer-uid-1"]
+	f.mu.Unlock()
+	if price == nil {
+		t.Fatal("expected a new product item price keyed by offer+item")
+	}
+	wantName := disambiguatedMeterLabel("CPU Allocated", priceID)
+	if price.ProductItemPriceName != wantName {
+		t.Errorf("productItemPriceName=%q, want %q", price.ProductItemPriceName, wantName)
+	}
+	if leftover == nil || leftover.ProductItemPriceName != "CPU Allocated" {
+		t.Errorf("leftover price name=%v, want original label", leftover)
+	}
+	if plan == nil || plan.ProductItemPriceIdsMap[leftoverItemID] != priceID {
+		t.Errorf("price map=%v, want leftover item UUID key", plan.ProductItemPriceIdsMap)
+	}
+
+	if _, err := c.EnsureProductPlan(context.Background(), baseDesiredProductPlan()); err != nil {
+		t.Fatalf("EnsureProductPlan second pass: %v", err)
+	}
+}
+
+func TestEnsureProductPlan_PreservesExistingPriceNameOnItemRetarget(t *testing.T) {
+	c, f := newTestClient(t)
+	const leftoverID = "3e421f8e-5c58-4598-abbc-7372f3a21539"
+	const siblingID = "dd14562d-46cf-4ace-b1e9-38e6d1089ac4"
+	priceID := productItemPriceID("offer-uid-1", "cpu-allocated")
+	unique := disambiguatedMeterLabel("CPU Allocated", priceID)
+	f.seedProductItem(wireProductItem{
+		ID:              leftoverID,
+		ProductItemName: "CPU Allocated",
+		MeterAPIName:    "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+		ProductID:       "1",
+		LockingStatus:   lockingStatusDeprecated,
+	})
+	f.seedProductItem(wireProductItem{
+		ID:              siblingID,
+		ProductItemName: unique,
+		MeterAPIName:    "meter-uid-cpu",
+		ProductID:       "1",
+		LockingStatus:   lockingStatusClose,
+	})
+	f.seedProductItemPrice(wireProductItemPrice{
+		ID:                   priceID,
+		ProductItemID:        leftoverID,
+		ProductItemPriceName: unique,
+		LockingStatus:        lockingStatusClose,
+	})
+
+	if _, err := c.EnsureProductPlan(context.Background(), baseDesiredProductPlan()); err != nil {
+		t.Fatalf("EnsureProductPlan: %v", err)
+	}
+
+	f.mu.Lock()
+	price := f.itemPrices[priceID]
+	f.mu.Unlock()
+	if price == nil {
+		t.Fatal("expected existing price to be kept")
+	}
+	if price.ProductItemPriceName != unique {
+		t.Errorf("productItemPriceName=%q, want preserved %q", price.ProductItemPriceName, unique)
+	}
+	if price.ProductItemID != siblingID {
+		t.Errorf("productItemId=%q, want sibling %q", price.ProductItemID, siblingID)
+	}
+}
+
 func TestEnsureProductPlan_EmptyIDPermanent(t *testing.T) {
 	c, _ := newTestClient(t)
 	_, err := c.EnsureProductPlan(context.Background(), DesiredProductPlan{})

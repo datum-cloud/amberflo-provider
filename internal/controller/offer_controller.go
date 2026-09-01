@@ -147,18 +147,24 @@ func (r *OfferReconciler) reconcileDelete(
 				r.Recorder.Eventf(offer, "Warning", EventReasonDeleteFailed, "transient: %v", err)
 			}
 			return ctrl.Result{RequeueAfter: transientRequeueAfter}, nil
-		default:
-			logger.Error(err, "DeleteProductPlan permanent failure; finalizer blocks deletion")
+		case amberflo.IsPermanent(err):
+			logger.Error(err, "DeleteProductPlan permanent failure; releasing finalizer and leaving Amberflo plan")
 			if r.Recorder != nil {
-				r.Recorder.Eventf(offer, "Warning", EventReasonDeleteFailed, "permanent: %v", err)
+				r.Recorder.Eventf(offer, "Warning", EventReasonDeleteFailed,
+					"permanent: %v; leaving Amberflo plan in place", err)
 			}
-			return ctrl.Result{RequeueAfter: permanentDisableRequeueAfter}, nil
+		default:
+			logger.Error(err, "DeleteProductPlan unclassified failure; requeueing")
+			if r.Recorder != nil {
+				r.Recorder.Eventf(offer, "Warning", EventReasonDeleteFailed, "unclassified: %v", err)
+			}
+			return ctrl.Result{RequeueAfter: transientRequeueAfter}, nil
 		}
-	}
-
-	logger.Info("Amberflo product plan deleted")
-	if r.Recorder != nil {
-		r.Recorder.Eventf(offer, "Normal", EventReasonDeleted, "Amberflo product plan %s deleted", planID)
+	} else {
+		logger.Info("Amberflo product plan deleted")
+		if r.Recorder != nil {
+			r.Recorder.Eventf(offer, "Normal", EventReasonDeleted, "Amberflo product plan %s deleted", planID)
+		}
 	}
 
 	controllerutil.RemoveFinalizer(offer, ProductPlanFinalizer)
@@ -175,11 +181,12 @@ func (r *OfferReconciler) handleAmberfloError(
 ) (ctrl.Result, error) {
 	switch {
 	case amberflo.IsPermanent(err):
-		logger.Error(err, "Amberflo EnsureProductPlan permanent failure")
+		logger.Error(err, "Amberflo EnsureProductPlan permanent failure; requeueing",
+			"requeueAfter", permanentDisableRequeueAfter.String())
 		if r.Recorder != nil {
 			r.Recorder.Eventf(offer, "Warning", EventReasonSyncFailed, "%s: %v", syncReasonPermanent, err)
 		}
-		return ctrl.Result{}, nil
+		return ctrl.Result{RequeueAfter: permanentDisableRequeueAfter}, nil
 	case amberflo.IsTransient(err):
 		logger.Info("Amberflo EnsureProductPlan transient failure; requeueing",
 			"err", err.Error(), "requeueAfter", transientRequeueAfter.String())
@@ -238,7 +245,7 @@ func (r *OfferReconciler) meterAPINameIndex(ctx context.Context) (map[string]str
 		if md.Spec.MeterName == "" {
 			continue
 		}
-		out[md.Spec.MeterName] = string(md.UID)
+		out[md.Spec.MeterName] = amberflo.MeterAPIName(md.Name)
 	}
 	return out, nil
 }

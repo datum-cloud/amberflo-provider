@@ -108,8 +108,8 @@ func (r *MeterDefinitionReconciler) Reconcile(ctx context.Context, req reconcile
 		return ctrl.Result{}, err
 	}
 
-	apiName := string(md.UID)
-	logger = logger.WithValues("uid", apiName, "meterName", md.Spec.MeterName)
+	apiName := amberflo.MeterAPIName(md.Name)
+	logger = logger.WithValues("uid", md.UID, "apiName", apiName, "meterName", md.Spec.MeterName)
 
 	// Deletion path: release the Amberflo meter, then drop the finalizer.
 	if !md.DeletionTimestamp.IsZero() {
@@ -199,7 +199,11 @@ func (r *MeterDefinitionReconciler) reconcileDelete(
 		return ctrl.Result{}, nil
 	}
 
-	if err := r.AmberfloClient.DeleteMeter(ctx, apiName); err != nil {
+	label := md.Spec.DisplayName
+	if label == "" {
+		label = md.Spec.MeterName
+	}
+	if err := r.AmberfloClient.DeleteMeter(ctx, apiName, label); err != nil {
 		switch {
 		case amberflo.IsTransient(err):
 			logger.Info("DeleteMeter transient failure; requeueing",
@@ -232,10 +236,11 @@ func (r *MeterDefinitionReconciler) reconcileDelete(
 	return ctrl.Result{}, nil
 }
 
-// handleAmberfloError mirrors the BillingAccount variant — classify the
-// error, emit an event, and decide whether to requeue. Unclassified
-// errors are treated as transient so a misclassification never wedges
-// the reconcile loop.
+// handleAmberfloError classifies the error, emits an event, and decides
+// whether to requeue. Permanent Amberflo failures requeue after
+// permanentDisableRequeueAfter so leftovers that later become adoptable
+// are retried without a pod restart. Unclassified errors are treated as
+// transient so a misclassification never wedges the reconcile loop.
 func (r *MeterDefinitionReconciler) handleAmberfloError(
 	logger logr.Logger,
 	md *billingv1alpha1.MeterDefinition,
@@ -243,12 +248,13 @@ func (r *MeterDefinitionReconciler) handleAmberfloError(
 ) (ctrl.Result, error) {
 	switch {
 	case amberflo.IsPermanent(err):
-		logger.Error(err, "Amberflo EnsureMeter permanent failure")
+		logger.Error(err, "Amberflo EnsureMeter permanent failure; requeueing",
+			"requeueAfter", permanentDisableRequeueAfter.String())
 		if r.Recorder != nil {
 			r.Recorder.Eventf(md, "Warning", EventReasonSyncFailed,
 				"%s: %v", syncReasonPermanent, err)
 		}
-		return ctrl.Result{}, nil
+		return ctrl.Result{RequeueAfter: permanentDisableRequeueAfter}, nil
 	case amberflo.IsTransient(err):
 		logger.Info("Amberflo EnsureMeter transient failure; requeueing",
 			"err", err.Error(),
@@ -297,11 +303,11 @@ func amberfloMeterType(a billingv1alpha1.MeterAggregation) (string, bool) {
 // desiredMeterFromDefinition translates a MeterDefinition into the
 // amberflo-client DesiredMeter shape.
 //
-// APIName is string(UID) — the design brief locks this in for
-// charset/length safety: spec.meterName is a reverse-DNS path that can
-// exceed Amberflo's id character set. Label is spec.displayName with a
-// fallback to spec.meterName so the Amberflo UI always has a
-// non-empty human-readable label.
+// APIName is MeterDefinition.metadata.name, shortened when it exceeds
+// Amberflo's 50-character meterApiName limit. The Kubernetes name
+// survives fan-out delete-recreate; the object UID does not.
+// spec.meterName is the reverse-DNS ingest key and is not used as the
+// Amberflo meterApiName.
 //
 // AggregationDimensions handling: active_users requires the full
 // dimension list to identify the "thing" being uniquely counted (e.g.
@@ -321,7 +327,7 @@ func desiredMeterFromDefinition(
 		aggDims = append([]string(nil), md.Spec.Measurement.Dimensions...)
 	}
 	return amberflo.DesiredMeter{
-		APIName:               string(md.UID),
+		APIName:               amberflo.MeterAPIName(md.Name),
 		Label:                 label,
 		MeterType:             meterType,
 		AggregationDimensions: aggDims,

@@ -40,8 +40,11 @@ func (s *stubClient) GetCustomer(ctx context.Context, _ string) (Customer, error
 func (s *stubClient) EnsureMeter(ctx context.Context, _ DesiredMeter) (Meter, error) {
 	return Meter{}, s.ensureMeterErr
 }
-func (s *stubClient) DeleteMeter(ctx context.Context, _ string) error { return s.deleteMeterErr }
+func (s *stubClient) DeleteMeter(ctx context.Context, _, _ string) error { return s.deleteMeterErr }
 func (s *stubClient) GetMeter(ctx context.Context, _ string) (Meter, error) {
+	return Meter{}, s.getMeterErr
+}
+func (s *stubClient) GetMeterByLabel(ctx context.Context, _ string) (Meter, error) {
 	return Meter{}, s.getMeterErr
 }
 func (s *stubClient) SubmitUsage(ctx context.Context, _ []UsageRecord) error { return nil }
@@ -116,7 +119,7 @@ func TestInstrumentedClient_DelegatesAndInstruments(t *testing.T) {
 	if _, err := wrapped.EnsureMeter(ctx, DesiredMeter{APIName: "x"}); err != nil {
 		t.Errorf("EnsureMeter passthrough: %v", err)
 	}
-	if err := wrapped.DeleteMeter(ctx, "x"); err != nil {
+	if err := wrapped.DeleteMeter(ctx, "x", ""); err != nil {
 		t.Errorf("DeleteMeter passthrough: %v", err)
 	}
 	if _, err := wrapped.GetMeter(ctx, "x"); err != nil {
@@ -128,7 +131,7 @@ func TestInstrumentedClient_DelegatesAndInstruments(t *testing.T) {
 		t.Errorf("expected EnsureMeter error pass-through")
 	}
 	stub.deleteMeterErr = &TransientError{Err: errors.New("t"), StatusCode: 503}
-	if err := wrapped.DeleteMeter(ctx, "x"); err == nil {
+	if err := wrapped.DeleteMeter(ctx, "x", ""); err == nil {
 		t.Errorf("expected DeleteMeter error pass-through")
 	}
 	stub.getMeterErr = fmt.Errorf("%w: id", ErrMeterNotFound)

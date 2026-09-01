@@ -85,8 +85,8 @@ type SubmissionConsumer struct {
 	// The UID is the Amberflo customerId.
 	BillingAccountCache *BillingAccountCache
 
-	// MeterCache maps MeterDefinition spec.meterName values to their UIDs.
-	// The UID is the Amberflo meterApiName.
+	// MeterCache maps MeterDefinition spec.meterName values to Amberflo meterApiName
+	// (metadata.name).
 	MeterCache *MeterDefinitionCache
 
 	// Logger is the structured logger.
@@ -253,8 +253,8 @@ func (c *SubmissionConsumer) prepareRecord(msg jetstream.Msg) (*amberflo.UsageRe
 	}
 	customerID := string(baUID)
 
-	// Resolve the MeterDefinition UID — this is the Amberflo meterApiName.
-	meterUID, ok := c.MeterCache.GetUID(ce.Type())
+	// Resolve the MeterDefinition Amberflo meterApiName (metadata.name).
+	meterAPIName, ok := c.MeterCache.GetAPIName(ce.Type())
 	if !ok {
 		c.Logger.Info("MeterDefinition not found for meterName; nacking for retry",
 			"meterName", ce.Type(),
@@ -262,7 +262,6 @@ func (c *SubmissionConsumer) prepareRecord(msg jetstream.Msg) (*amberflo.UsageRe
 		)
 		return nil, fmt.Errorf("MeterDefinition %q not found in cache", ce.Type())
 	}
-	meterAPIName := string(meterUID)
 
 	// Deserialise the event payload.
 	var data eventData

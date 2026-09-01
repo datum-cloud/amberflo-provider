@@ -111,8 +111,8 @@ func newTestConsumer(t *testing.T, ingestClient amberflo.IngestClient, meterCach
 }
 
 // meterCacheWith returns a MeterDefinitionCache pre-populated with the given entries.
-func meterCacheWith(entries map[string]types.UID) *MeterDefinitionCache {
-	return &MeterDefinitionCache{uidByMeterName: entries}
+func meterCacheWith(entries map[string]string) *MeterDefinitionCache {
+	return &MeterDefinitionCache{apiNameByMeterName: entries}
 }
 
 // baCacheWith returns a BillingAccountCache pre-populated with the given entries.
@@ -124,12 +124,12 @@ func baCacheWith(entries map[string]types.UID) *BillingAccountCache {
 // and the ingest client receives the correct UsageRecord.
 func TestProcessMessage_HappyPath(t *testing.T) {
 	meterName := "compute.miloapis.com/cpu"
-	meterUID := types.UID("meter-uid-abc")
+	meterAPIName := "compute-miloapis-com-cpu"
 	baUID := types.UID("billing-account-uid-abc")
 
 	ingest := &fakeIngestClient{}
 	consumer := newTestConsumer(t, ingest,
-		meterCacheWith(map[string]types.UID{meterName: meterUID}),
+		meterCacheWith(map[string]string{meterName: meterAPIName}),
 		baCacheWith(map[string]types.UID{"acct-xyz": baUID}),
 	)
 
@@ -153,8 +153,8 @@ func TestProcessMessage_HappyPath(t *testing.T) {
 	if got.CustomerID != string(baUID) {
 		t.Errorf("CustomerID: got %q want %q", got.CustomerID, string(baUID))
 	}
-	if got.MeterAPIName != string(meterUID) {
-		t.Errorf("MeterAPIName: got %q want %q", got.MeterAPIName, string(meterUID))
+	if got.MeterAPIName != meterAPIName {
+		t.Errorf("MeterAPIName: got %q want %q", got.MeterAPIName, meterAPIName)
 	}
 	if got.MeterValue != 100 {
 		t.Errorf("MeterValue: got %d want 100", got.MeterValue)
@@ -169,7 +169,7 @@ func TestProcessMessage_HappyPath(t *testing.T) {
 func TestProcessMessage_MalformedCloudEvent(t *testing.T) {
 	ingest := &fakeIngestClient{}
 	consumer := newTestConsumer(t, ingest,
-		meterCacheWith(map[string]types.UID{}),
+		meterCacheWith(map[string]string{}),
 		baCacheWith(map[string]types.UID{}),
 	)
 
@@ -192,11 +192,11 @@ func TestProcessMessage_MalformedCloudEvent(t *testing.T) {
 // BillingAccount UID cannot be resolved, the message is nacked for retry.
 func TestProcessMessage_BillingAccountCacheMiss(t *testing.T) {
 	meterName := "compute.miloapis.com/cpu"
-	meterUID := types.UID("meter-uid-abc")
+	meterAPIName := "compute-miloapis-com-cpu"
 
 	ingest := &fakeIngestClient{}
 	consumer := newTestConsumer(t, ingest,
-		meterCacheWith(map[string]types.UID{meterName: meterUID}),
+		meterCacheWith(map[string]string{meterName: meterAPIName}),
 		baCacheWith(map[string]types.UID{}), // empty — BA not yet indexed
 	)
 
@@ -216,13 +216,13 @@ func TestProcessMessage_BillingAccountCacheMiss(t *testing.T) {
 }
 
 // TestProcessMessage_MeterDefinitionCacheMiss verifies that when no
-// MeterDefinition UID can be resolved, the message is nacked for retry.
+// MeterDefinition Amberflo meterApiName cannot be resolved, the message is nacked for retry.
 func TestProcessMessage_MeterDefinitionCacheMiss(t *testing.T) {
 	baUID := types.UID("billing-account-uid-abc")
 
 	ingest := &fakeIngestClient{}
 	consumer := newTestConsumer(t, ingest,
-		meterCacheWith(map[string]types.UID{}), // empty — meter not indexed
+		meterCacheWith(map[string]string{}), // empty — meter not indexed
 		baCacheWith(map[string]types.UID{"acct-xyz": baUID}),
 	)
 
@@ -245,14 +245,14 @@ func TestProcessMessage_MeterDefinitionCacheMiss(t *testing.T) {
 // error results in the message being nacked.
 func TestProcessMessage_TransientIngestError(t *testing.T) {
 	meterName := "compute.miloapis.com/mem"
-	meterUID := types.UID("meter-uid-def")
+	meterAPIName := "compute-miloapis-com-mem"
 	baUID := types.UID("billing-account-uid-def")
 
 	ingest := &fakeIngestClient{
 		submitErr: &amberflo.TransientError{Err: fmt.Errorf("503 service unavailable"), StatusCode: 503},
 	}
 	consumer := newTestConsumer(t, ingest,
-		meterCacheWith(map[string]types.UID{meterName: meterUID}),
+		meterCacheWith(map[string]string{meterName: meterAPIName}),
 		baCacheWith(map[string]types.UID{"acct-xyz": baUID}),
 	)
 
@@ -275,14 +275,14 @@ func TestProcessMessage_TransientIngestError(t *testing.T) {
 // error results in the message being acked (discarded after logging).
 func TestProcessMessage_PermanentIngestError(t *testing.T) {
 	meterName := "compute.miloapis.com/storage"
-	meterUID := types.UID("meter-uid-ghi")
+	meterAPIName := "compute-miloapis-com-storage"
 	baUID := types.UID("billing-account-uid-ghi")
 
 	ingest := &fakeIngestClient{
 		submitErr: &amberflo.PermanentError{Err: fmt.Errorf("invalid record"), StatusCode: 400},
 	}
 	consumer := newTestConsumer(t, ingest,
-		meterCacheWith(map[string]types.UID{meterName: meterUID}),
+		meterCacheWith(map[string]string{meterName: meterAPIName}),
 		baCacheWith(map[string]types.UID{"acct-xyz": baUID}),
 	)
 
@@ -306,12 +306,12 @@ func TestProcessMessage_PermanentIngestError(t *testing.T) {
 // calling the ingest client.
 func TestProcessMessage_MalformedEventDataValue(t *testing.T) {
 	meterName := "compute.miloapis.com/cpu"
-	meterUID := types.UID("meter-uid-abc")
+	meterAPIName := "compute-miloapis-com-cpu"
 	baUID := types.UID("billing-account-uid-abc")
 
 	ingest := &fakeIngestClient{}
 	consumer := newTestConsumer(t, ingest,
-		meterCacheWith(map[string]types.UID{meterName: meterUID}),
+		meterCacheWith(map[string]string{meterName: meterAPIName}),
 		baCacheWith(map[string]types.UID{"acct-xyz": baUID}),
 	)
 
@@ -347,7 +347,7 @@ func TestProcessMessage_MalformedEventDataValue(t *testing.T) {
 func TestProcessMessage_MissingBillingAccountRef(t *testing.T) {
 	ingest := &fakeIngestClient{}
 	consumer := newTestConsumer(t, ingest,
-		meterCacheWith(map[string]types.UID{}),
+		meterCacheWith(map[string]string{}),
 		baCacheWith(map[string]types.UID{}),
 	)
 
@@ -388,7 +388,7 @@ func (f *fakeBatchIngestClient) SubmitUsage(ctx context.Context, records []amber
 
 func TestProcessMessages_HappyPath_Batch(t *testing.T) {
 	meterName := "compute.miloapis.com/cpu"
-	meterUID := types.UID("meter-uid-abc")
+	meterAPIName := "compute-miloapis-com-cpu"
 	baUID := types.UID("billing-account-uid-abc")
 
 	calledBatch := false
@@ -401,7 +401,7 @@ func TestProcessMessages_HappyPath_Batch(t *testing.T) {
 		},
 	}
 	consumer := newTestConsumer(t, ingest,
-		meterCacheWith(map[string]types.UID{meterName: meterUID}),
+		meterCacheWith(map[string]string{meterName: meterAPIName}),
 		baCacheWith(map[string]types.UID{"acct-xyz": baUID}),
 	)
 
@@ -429,7 +429,7 @@ func TestProcessMessages_HappyPath_Batch(t *testing.T) {
 
 func TestProcessMessages_TransientValidationAndSuccess(t *testing.T) {
 	meterName := "compute.miloapis.com/cpu"
-	meterUID := types.UID("meter-uid-abc")
+	meterAPIName := "compute-miloapis-com-cpu"
 	baUID := types.UID("billing-account-uid-abc")
 
 	ingest := &fakeBatchIngestClient{
@@ -438,7 +438,7 @@ func TestProcessMessages_TransientValidationAndSuccess(t *testing.T) {
 		},
 	}
 	consumer := newTestConsumer(t, ingest,
-		meterCacheWith(map[string]types.UID{meterName: meterUID}),
+		meterCacheWith(map[string]string{meterName: meterAPIName}),
 		baCacheWith(map[string]types.UID{"acct-xyz": baUID}),
 	)
 
@@ -480,7 +480,7 @@ func TestProcessMessages_TransientValidationAndSuccess(t *testing.T) {
 
 func TestProcessMessages_BatchPermanentErrorFallback(t *testing.T) {
 	meterName := "compute.miloapis.com/cpu"
-	meterUID := types.UID("meter-uid-abc")
+	meterAPIName := "compute-miloapis-com-cpu"
 	baUID := types.UID("billing-account-uid-abc")
 
 	// We want to simulate Amberflo rejecting the batch of 2,
@@ -501,7 +501,7 @@ func TestProcessMessages_BatchPermanentErrorFallback(t *testing.T) {
 		},
 	}
 	consumer := newTestConsumer(t, ingest,
-		meterCacheWith(map[string]types.UID{meterName: meterUID}),
+		meterCacheWith(map[string]string{meterName: meterAPIName}),
 		baCacheWith(map[string]types.UID{"acct-xyz": baUID}),
 	)
 
@@ -531,7 +531,7 @@ func TestProcessMessages_BatchPermanentErrorFallback(t *testing.T) {
 
 func TestProcessMessages_BatchTransientError(t *testing.T) {
 	meterName := "compute.miloapis.com/cpu"
-	meterUID := types.UID("meter-uid-abc")
+	meterAPIName := "compute-miloapis-com-cpu"
 	baUID := types.UID("billing-account-uid-abc")
 
 	ingest := &fakeBatchIngestClient{
@@ -540,7 +540,7 @@ func TestProcessMessages_BatchTransientError(t *testing.T) {
 		},
 	}
 	consumer := newTestConsumer(t, ingest,
-		meterCacheWith(map[string]types.UID{meterName: meterUID}),
+		meterCacheWith(map[string]string{meterName: meterAPIName}),
 		baCacheWith(map[string]types.UID{"acct-xyz": baUID}),
 	)
 

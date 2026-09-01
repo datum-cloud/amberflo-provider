@@ -47,6 +47,13 @@ type fakeServer struct {
 	productPlans  map[string]*wireProductPlan
 	customerPlans map[string][]wireCustomerProductPlan
 	requests      []recordedRequest
+	// occupiedLabels 400s POST /meters even when GET /meters?label=
+	// returns nothing — staging leftovers occupy labels this way.
+	occupiedLabels map[string]struct{}
+
+	// customerPlanNow, when set, 400s customer-pricing POSTs whose
+	// endTimeInSeconds is not strictly after this unix timestamp.
+	customerPlanNow int64
 
 	// failure injection
 	failStatus     int
@@ -94,15 +101,16 @@ type recordedRequest struct {
 func newFake(t *testing.T) *fakeServer {
 	t.Helper()
 	f := &fakeServer{
-		apiKey:        "unit-test-key",
-		customers:     map[string]*storedWireCustomer{},
-		meters:        map[string]*storedWireMeter{},
-		invoices:      map[string][]CustomerProductInvoice{},
-		latest:        map[string]*CustomerProductInvoice{},
-		productItems:  map[string]*wireProductItem{},
-		itemPrices:    map[string]*wireProductItemPrice{},
-		productPlans:  map[string]*wireProductPlan{},
-		customerPlans: map[string][]wireCustomerProductPlan{},
+		apiKey:         "unit-test-key",
+		customers:      map[string]*storedWireCustomer{},
+		meters:         map[string]*storedWireMeter{},
+		invoices:       map[string][]CustomerProductInvoice{},
+		latest:         map[string]*CustomerProductInvoice{},
+		productItems:   map[string]*wireProductItem{},
+		itemPrices:     map[string]*wireProductItemPrice{},
+		productPlans:   map[string]*wireProductPlan{},
+		customerPlans:  map[string][]wireCustomerProductPlan{},
+		occupiedLabels: map[string]struct{}{},
 	}
 	f.srv = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(f.srv.Close)
@@ -151,6 +159,46 @@ func (f *fakeServer) seedMeter(m storedWireMeter) {
 	cp.Dimensions = append([]string(nil), m.Dimensions...)
 	cp.AggregationDimensions = append([]string(nil), m.AggregationDimensions...)
 	f.meters[m.MeterAPIName] = &cp
+}
+
+func (f *fakeServer) occupyLabel(label string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.occupiedLabels[label] = struct{}{}
+}
+
+func (f *fakeServer) seedProductItem(item wireProductItem) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cp := item
+	f.productItems[item.ID] = &cp
+}
+
+func (f *fakeServer) seedProductItemPrice(price wireProductItemPrice) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cp := price
+	if len(price.Price) > 0 {
+		cp.Price = append(json.RawMessage(nil), price.Price...)
+	}
+	f.itemPrices[price.ID] = &cp
+}
+
+func (f *fakeServer) seedProductPlan(plan wireProductPlan) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cp := plan
+	f.productPlans[plan.ID] = &cp
+}
+
+func (f *fakeServer) fetchProductItem(id string) (wireProductItem, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	item, ok := f.productItems[id]
+	if !ok || item == nil {
+		return wireProductItem{}, false
+	}
+	return *item, true
 }
 
 // fetchMeter returns a deep copy of a stored meter or false. Used by
@@ -264,14 +312,22 @@ func (f *fakeServer) serve(w http.ResponseWriter, r *http.Request) {
 
 	case r.Method == http.MethodGet && r.URL.Path == "/meters":
 		// List-with-filter: the live API returns [] when no match.
-		// The client only ever uses ?meterApiName=<x>, so that's all we
-		// support. Requests without the filter return every meter (rare
-		// in tests; helpful for debugging).
-		filter := r.URL.Query().Get("meterApiName")
+		// The client uses ?meterApiName=<x> and ?label=<x>.
+		apiNameFilter := r.URL.Query().Get("meterApiName")
+		labelFilter := r.URL.Query().Get("label")
+		if len(apiNameFilter) > maxMeterAPINameLen {
+			http.Error(w,
+				`{"errorMessage":"Invalid request: Invalid field: 'meterApiName', value: '`+apiNameFilter+`'"}`,
+				http.StatusBadRequest)
+			return
+		}
 		f.mu.Lock()
 		out := make([]storedWireMeter, 0, len(f.meters))
 		for _, m := range f.meters {
-			if filter != "" && m.MeterAPIName != filter {
+			if apiNameFilter != "" && m.MeterAPIName != apiNameFilter {
+				continue
+			}
+			if labelFilter != "" && m.Label != labelFilter {
 				continue
 			}
 			// Copy to avoid lock-scope aliasing.
@@ -305,6 +361,35 @@ func (f *fakeServer) serve(w http.ResponseWriter, r *http.Request) {
 				`{"errorMessage":"Invalid request: Meter already exists with 'meterApiName': `+existing.MeterAPIName+`"}`,
 				http.StatusBadRequest)
 			return
+		}
+		for _, m := range f.meters {
+			if in.Label != "" && m.Label == in.Label {
+				f.mu.Unlock()
+				http.Error(w,
+					`{"errorMessage":"Invalid request: Meter already exists with 'label': `+in.Label+`"}`,
+					http.StatusBadRequest)
+				return
+			}
+		}
+		if in.Label != "" {
+			if _, occupied := f.occupiedLabels[in.Label]; occupied {
+				f.mu.Unlock()
+				http.Error(w,
+					`{"errorMessage":"Invalid request: Meter already exists with 'label': `+in.Label+`"}`,
+					http.StatusBadRequest)
+				return
+			}
+		}
+		if in.UseInBilling && in.Label != "" {
+			for _, item := range f.productItems {
+				if item != nil && item.ProductItemName == in.Label {
+					f.mu.Unlock()
+					http.Error(w,
+						`{"errorMessage":"Invalid request: Meter already exists with 'label': `+in.Label+`"}`,
+						http.StatusBadRequest)
+					return
+				}
+			}
 		}
 		id := "fake-id-" + in.MeterAPIName
 		// Default lockingStatus to "open" if the caller omitted it —
@@ -346,11 +431,24 @@ func (f *fakeServer) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		f.mu.Lock()
-		existing, ok := f.meters[in.MeterAPIName]
-		if !ok {
-			f.mu.Unlock()
-			http.Error(w, "not found", http.StatusNotFound)
-			return
+		var existing *storedWireMeter
+		var oldKey string
+		for key, m := range f.meters {
+			if in.ID != "" && m.ID == in.ID {
+				existing = m
+				oldKey = key
+				break
+			}
+		}
+		if existing == nil {
+			var ok bool
+			existing, ok = f.meters[in.MeterAPIName]
+			if !ok {
+				f.mu.Unlock()
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			oldKey = in.MeterAPIName
 		}
 		if in.ID == "" || in.ID != existing.ID {
 			f.mu.Unlock()
@@ -372,6 +470,13 @@ func (f *fakeServer) serve(w http.ResponseWriter, r *http.Request) {
 				http.StatusBadRequest)
 			return
 		}
+		if in.MeterAPIName != existing.MeterAPIName && existing.LockingStatus != "open" {
+			f.mu.Unlock()
+			http.Error(w,
+				`{"errorMessage":"Invalid request: meterApiName cannot be changed while lockingStatus is `+existing.LockingStatus+`"}`,
+				http.StatusBadRequest)
+			return
+		}
 		existing.Label = in.Label
 		existing.MeterType = in.MeterType
 		existing.Unit = in.Unit
@@ -380,6 +485,11 @@ func (f *fakeServer) serve(w http.ResponseWriter, r *http.Request) {
 		existing.UseInBilling = in.UseInBilling
 		if in.LockingStatus != "" {
 			existing.LockingStatus = in.LockingStatus
+		}
+		if in.MeterAPIName != oldKey {
+			delete(f.meters, oldKey)
+			existing.MeterAPIName = in.MeterAPIName
+			f.meters[in.MeterAPIName] = existing
 		}
 		out := *existing
 		out.Dimensions = append([]string(nil), existing.Dimensions...)
@@ -491,6 +601,19 @@ func (f *fakeServer) serve(w http.ResponseWriter, r *http.Request) {
 // customer-pricing routes used by EnsureProductPlan / EnsureCustomerPlan.
 func (f *fakeServer) servePricing(w http.ResponseWriter, r *http.Request, body []byte) bool {
 	switch {
+	case r.Method == http.MethodGet && r.URL.Path == productItemsListPath:
+		f.mu.Lock()
+		out := make([]wireProductItem, 0, len(f.productItems))
+		for _, item := range f.productItems {
+			if item == nil {
+				continue
+			}
+			out = append(out, *item)
+		}
+		f.mu.Unlock()
+		writeJSON(w, http.StatusOK, out)
+		return true
+
 	case r.Method == http.MethodGet && r.URL.Path == productItemsPath:
 		id := r.URL.Query().Get("productItemId")
 		if id == "" {
@@ -514,7 +637,30 @@ func (f *fakeServer) servePricing(w http.ResponseWriter, r *http.Request, body [
 			return true
 		}
 		f.mu.Lock()
+		if existing, ok := f.productItems[in.ID]; ok {
+			// Staging: deprecated leftovers reject every field change,
+			// including walking lockingStatus off deprecated.
+			if existing.LockingStatus == lockingStatusDeprecated {
+				f.mu.Unlock()
+				http.Error(w,
+					`{"errorMessage":"Invalid request: existing entity is deprecated RelationTarget{relatedClass=ProductItem, targetId='`+in.ID+`'"}`,
+					http.StatusBadRequest)
+				return true
+			}
+			cp := in
+			f.productItems[in.ID] = &cp
+			f.mu.Unlock()
+			writeJSON(w, http.StatusOK, in)
+			return true
+		}
 		for _, existing := range f.productItems {
+			if existing != nil && existing.ProductItemName == in.ProductItemName {
+				f.mu.Unlock()
+				http.Error(w,
+					`{"errorMessage":"Invalid request: Product item with name already exists: `+in.ProductItemName+`"}`,
+					http.StatusBadRequest)
+				return true
+			}
 			if existing != nil && existing.MeterAPIName == in.MeterAPIName {
 				f.mu.Unlock()
 				http.Error(w, `{"errorMessage":"Some items of a product (1) have the same meter"}`, http.StatusBadRequest)
@@ -525,6 +671,47 @@ func (f *fakeServer) servePricing(w http.ResponseWriter, r *http.Request, body [
 		f.productItems[in.ID] = &cp
 		f.mu.Unlock()
 		writeJSON(w, http.StatusOK, in)
+		return true
+
+	case r.Method == http.MethodDelete && r.URL.Path == productItemsPath:
+		id := r.URL.Query().Get("productItemId")
+		if id == "" {
+			http.Error(w, "productItemId required", http.StatusBadRequest)
+			return true
+		}
+		f.mu.Lock()
+		item, ok := f.productItems[id]
+		if !ok || item == nil {
+			f.mu.Unlock()
+			http.Error(w, "not found", http.StatusNotFound)
+			return true
+		}
+		for _, plan := range f.productPlans {
+			if plan == nil {
+				continue
+			}
+			if _, used := plan.ProductItemPriceIdsMap[id]; used {
+				f.mu.Unlock()
+				http.Error(w,
+					`{"errorMessage":"Invalid request: Can't delete entity RelationTarget{relatedClass=ProductItem, targetId='`+id+`'} as other entities rely on it"}`,
+					http.StatusBadRequest)
+				return true
+			}
+		}
+		status := item.LockingStatus
+		if status == "" {
+			status = lockingStatusClose
+		}
+		if status != lockingStatusDeprecated {
+			f.mu.Unlock()
+			http.Error(w,
+				`{"errorMessage":"'lockingStatus' `+status+` prevents product item from being deleted."}`,
+				http.StatusBadRequest)
+			return true
+		}
+		delete(f.productItems, id)
+		f.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
 		return true
 
 	case r.Method == http.MethodGet && r.URL.Path == productItemPricePath:
@@ -550,6 +737,23 @@ func (f *fakeServer) servePricing(w http.ResponseWriter, r *http.Request, body [
 			return true
 		}
 		f.mu.Lock()
+		if existing, ok := f.itemPrices[in.ID]; ok && existing != nil &&
+			existing.ProductItemPriceName != "" && existing.ProductItemPriceName != in.ProductItemPriceName {
+			f.mu.Unlock()
+			http.Error(w,
+				`{"errorMessage":"Invalid request: Property productItemPriceName of Entity RelationTarget{relatedClass=ProductItemPrice, targetId='`+in.ID+`'} was changed (old value: `+existing.ProductItemPriceName+`, new value: `+in.ProductItemPriceName+`)."}`,
+				http.StatusBadRequest)
+			return true
+		}
+		for id, existing := range f.itemPrices {
+			if existing != nil && existing.ProductItemPriceName == in.ProductItemPriceName && id != in.ID {
+				f.mu.Unlock()
+				http.Error(w,
+					`{"errorMessage":"Invalid request: Product item rate with name already exists: `+in.ProductItemPriceName+`"}`,
+					http.StatusBadRequest)
+				return true
+			}
+		}
 		cp := in
 		if len(in.Price) > 0 {
 			cp.Price = append(json.RawMessage(nil), in.Price...)
@@ -660,6 +864,15 @@ func (f *fakeServer) servePricing(w http.ResponseWriter, r *http.Request, body [
 			return true
 		}
 		f.mu.Lock()
+		if f.customerPlanNow > 0 && in.EndTimeInSeconds > 0 && in.EndTimeInSeconds <= f.customerPlanNow {
+			end := in.EndTimeInSeconds
+			f.mu.Unlock()
+			http.Error(w,
+				`{"errorMessage":"Invalid request: customerProductPlan end time can't be in the past: `+
+					time.Unix(end, 0).UTC().Format(time.RFC3339)+`"}`,
+				http.StatusBadRequest)
+			return true
+		}
 		plans := f.customerPlans[in.CustomerID]
 		replaced := false
 		for i := range plans {

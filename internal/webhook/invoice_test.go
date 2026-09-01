@@ -35,12 +35,12 @@ import (
 
 // stubAmberflo is a minimal amberflo.Client for webhook tests.
 type stubAmberflo struct {
-	invoices    []amberflo.CustomerProductInvoice
-	byKey       map[string]amberflo.CustomerProductInvoice
-	listErr     error
-	getErr      error
-	getCalls    int
-	listCalls   int
+	invoices  []amberflo.CustomerProductInvoice
+	byKey     map[string]amberflo.CustomerProductInvoice
+	listErr   error
+	getErr    error
+	getCalls  int
+	listCalls int
 }
 
 func (s *stubAmberflo) EnsureCustomer(context.Context, amberflo.DesiredCustomer) (amberflo.Customer, error) {
@@ -53,8 +53,11 @@ func (s *stubAmberflo) GetCustomer(context.Context, string) (amberflo.Customer, 
 func (s *stubAmberflo) EnsureMeter(context.Context, amberflo.DesiredMeter) (amberflo.Meter, error) {
 	return amberflo.Meter{}, nil
 }
-func (s *stubAmberflo) DeleteMeter(context.Context, string) error { return nil }
+func (s *stubAmberflo) DeleteMeter(context.Context, string, string) error { return nil }
 func (s *stubAmberflo) GetMeter(context.Context, string) (amberflo.Meter, error) {
+	return amberflo.Meter{}, nil
+}
+func (s *stubAmberflo) GetMeterByLabel(context.Context, string) (amberflo.Meter, error) {
 	return amberflo.Meter{}, nil
 }
 func (s *stubAmberflo) SubmitUsage(context.Context, []amberflo.UsageRecord) error { return nil }
@@ -302,12 +305,12 @@ func TestParseInvoiceReadyEvent(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name       string
-		body       string
-		wantCust   string
-		wantURI    string
-		wantKey    bool
-		wantErr    bool
+		name     string
+		body     string
+		wantCust string
+		wantURI  string
+		wantKey  bool
+		wantErr  bool
 	}{
 		{
 			name: "amberflo envelope with key fields",

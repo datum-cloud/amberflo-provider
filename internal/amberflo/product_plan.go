@@ -23,11 +23,13 @@ import (
 	"reflect"
 	"sort"
 	"strconv"
+	"strings"
 )
 
 // Amberflo account-pricing paths used by the product-plan client.
 const (
 	productItemsPath      = "/payments/pricing/amberflo/account-pricing/product-items"
+	productItemsListPath  = productItemsPath + "/list"
 	productItemPricePath  = "/payments/pricing/amberflo/account-pricing/product-item-price"
 	productPlansPath      = "/payments/pricing/amberflo/account-pricing/product-plans"
 	defaultProductPlanPID = "1"
@@ -95,7 +97,7 @@ type DesiredPlanItem struct {
 	ChargeType PlanChargeType
 
 	// MeterAPIName is the Amberflo meterApiName for Usage items
-	// (= string(MeterDefinition.UID)). Required when ChargeType=usage.
+	// (= MeterDefinition.metadata.name). Required when ChargeType=usage.
 	MeterAPIName string
 	// Rates are Usage rate entries. Exactly one of Flat or Tiers is set
 	// per entry; Match optionally scopes the rate to a dimension value.
@@ -145,6 +147,7 @@ type wireProductItem struct {
 	ProductItemName string `json:"productItemName,omitempty"`
 	MeterAPIName    string `json:"meterApiName,omitempty"`
 	ProductID       string `json:"productId,omitempty"`
+	LockingStatus   string `json:"lockingStatus,omitempty"`
 }
 
 // wirePriceTier is one LeafNode tier on the wire.
@@ -308,12 +311,13 @@ func (c *client) EnsureProductPlan(ctx context.Context, desired DesiredProductPl
 			if item.MeterAPIName == "" {
 				return ProductPlan{}, &PermanentError{Err: fmt.Errorf("DesiredPlanItem %q: MeterAPIName is required for usage", item.ID)}
 			}
-			if err := c.ensureProductItem(ctx, wireProductItem{
+			productItemID, err := c.ensureProductItem(ctx, wireProductItem{
 				ID:              item.MeterAPIName,
 				ProductItemName: firstNonEmpty(item.Label, item.MeterAPIName),
 				MeterAPIName:    item.MeterAPIName,
 				ProductID:       productID,
-			}); err != nil {
+			})
+			if err != nil {
 				return ProductPlan{}, err
 			}
 			priceID := productItemPriceID(desired.ID, item.ID)
@@ -327,15 +331,15 @@ func (c *client) EnsureProductPlan(ctx context.Context, desired DesiredProductPl
 			}
 			if err := c.ensureProductItemPrice(ctx, wireProductItemPrice{
 				ID:                   priceID,
-				ProductItemID:        item.MeterAPIName,
-				ProductItemPriceName: firstNonEmpty(item.Label, item.ID),
+				ProductItemID:        productItemID,
+				ProductItemPriceName: disambiguatedMeterLabel(firstNonEmpty(item.Label, item.ID), priceID),
 				Price:                priceRaw,
 				LockingStatus:        lockingStatusClose,
 			}); err != nil {
 				return ProductPlan{}, err
 			}
-			priceIDs[item.MeterAPIName] = priceID
-			gen, err := priceGeneratorFromMachine(priceID, item, price)
+			priceIDs[productItemID] = priceID
+			gen, err := priceGeneratorFromMachine(priceID, item, price, productItemID)
 			if err != nil {
 				return ProductPlan{}, &PermanentError{Err: fmt.Errorf("DesiredPlanItem %q: %w", item.ID, err)}
 			}
@@ -444,24 +448,99 @@ func (c *client) DeleteProductPlan(ctx context.Context, id string) error {
 	return nil
 }
 
-func (c *client) ensureProductItem(ctx context.Context, item wireProductItem) error {
+func (c *client) listProductItems(ctx context.Context) ([]wireProductItem, error) {
+	var items []wireProductItem
+	_, _, err := c.doJSON(ctx, http.MethodGet, productItemsListPath, nil, &items)
+	if err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+func (c *client) updateProductItem(ctx context.Context, item wireProductItem) error {
 	if item.ID == "" {
 		return &PermanentError{Err: errors.New("product item id is required")}
+	}
+	_, _, err := c.doJSON(ctx, http.MethodPost, productItemsPath, item, nil)
+	return err
+}
+
+func (c *client) ensureProductItem(ctx context.Context, item wireProductItem) (string, error) {
+	if item.ID == "" {
+		return "", &PermanentError{Err: errors.New("product item id is required")}
 	}
 	path := accountPricingQueryPath(productItemsPath, productItemIDQueryParam, item.ID)
 	var got wireProductItem
 	_, _, err := c.doJSON(ctx, http.MethodGet, path, nil, &got)
-	if err == nil && got.ID != "" {
-		return nil
-	}
-	if err != nil {
+	found := err == nil && got.ID != ""
+	if !found && err != nil {
 		var perm *PermanentError
 		if !errors.As(err, &perm) || perm.StatusCode != http.StatusNotFound {
-			return err
+			return "", err
 		}
 	}
+	if !found {
+		leftover, ok, listErr := c.productItemForMeter(ctx, item.MeterAPIName)
+		if listErr != nil {
+			return "", listErr
+		}
+		if !ok {
+			leftover, ok, listErr = c.productItemNamed(ctx, item.ProductItemName)
+			if listErr != nil {
+				return "", listErr
+			}
+			if ok {
+				if err := c.rejectLiveForeignProductItem(ctx, leftover, item.MeterAPIName); err != nil {
+					return "", err
+				}
+			}
+		}
+		if ok {
+			got = leftover
+			found = true
+		}
+	}
+	if found {
+		if err := c.pointProductItemAtMeter(ctx, got, item.MeterAPIName); err != nil {
+			if IsTransient(err) {
+				return "", err
+			}
+			// Immutable leftover: reuse a sibling already on this meter
+			// (Amberflo assigns UUID ids, so GET by meterApiName misses).
+			sibling, ok, listErr := c.productItemForMeter(ctx, item.MeterAPIName)
+			if listErr != nil {
+				return "", listErr
+			}
+			if ok && sibling.ID != got.ID {
+				return sibling.ID, nil
+			}
+			item.ProductItemName = disambiguatedMeterLabel(item.ProductItemName, item.MeterAPIName)
+			found = false
+		}
+	}
+	if found {
+		return got.ID, nil
+	}
 	_, _, err = c.doJSON(ctx, http.MethodPost, productItemsPath, item, nil)
-	return err
+	if err != nil {
+		if !isProductItemSameMeterError(err) {
+			return "", err
+		}
+		sibling, ok, listErr := c.productItemForMeter(ctx, item.MeterAPIName)
+		if listErr != nil {
+			return "", listErr
+		}
+		if ok {
+			return sibling.ID, nil
+		}
+		return "", err
+	}
+	if created, ok, listErr := c.productItemForMeter(ctx, item.MeterAPIName); listErr != nil {
+		return "", listErr
+	} else if ok {
+		return created.ID, nil
+	}
+	return item.ID, nil
 }
 
 func (c *client) ensureProductItemPrice(ctx context.Context, price wireProductItemPrice) error {
@@ -471,24 +550,70 @@ func (c *client) ensureProductItemPrice(ctx context.Context, price wireProductIt
 	switch {
 	case err == nil && existing.ID != "":
 		if existing.ProductItemID == price.ProductItemID &&
-			existing.ProductItemPriceName == price.ProductItemPriceName &&
+			productItemPriceNameAcceptable(existing.ProductItemPriceName, price.ProductItemPriceName, price.ID) &&
 			jsonEqual(existing.Price, price.Price) {
 			return nil
 		}
+		// Amberflo rejects renaming a stored rate; keep the unique
+		// leftover name and only update item/price fields.
+		if existing.ProductItemPriceName != "" {
+			price.ProductItemPriceName = existing.ProductItemPriceName
+		}
 		_, _, err = c.doJSON(ctx, http.MethodPost, productItemPricePath, price, nil)
-		return err
+		return c.recoverProductItemPriceNameCollision(ctx, price, err)
 	case err == nil:
 		// Amberflo returns 200 with a null body when the price is absent.
 		_, _, err = c.doJSON(ctx, http.MethodPost, productItemPricePath, price, nil)
-		return err
+		return c.recoverProductItemPriceNameCollision(ctx, price, err)
 	default:
 		var perm *PermanentError
 		if errors.As(err, &perm) && perm.StatusCode == http.StatusNotFound {
 			_, _, err = c.doJSON(ctx, http.MethodPost, productItemPricePath, price, nil)
-			return err
+			return c.recoverProductItemPriceNameCollision(ctx, price, err)
 		}
 		return err
 	}
+}
+
+// recoverProductItemPriceNameCollision retries a price POST with a unique
+// display name when leftover payg-v1 rates already occupy the original
+// label. The plan still keys on the stable price id.
+func (c *client) recoverProductItemPriceNameCollision(ctx context.Context, price wireProductItemPrice, err error) error {
+	if err == nil || !isProductItemPriceNameCollisionError(err) {
+		return err
+	}
+	price.ProductItemPriceName = disambiguatedMeterLabel(price.ProductItemPriceName, price.ID)
+	_, _, err = c.doJSON(ctx, http.MethodPost, productItemPricePath, price, nil)
+	return err
+}
+
+func isProductItemPriceNameCollisionError(err error) bool {
+	var perm *PermanentError
+	if !errors.As(err, &perm) {
+		return false
+	}
+	msg := perm.ResponseBody
+	if msg == "" && perm.Err != nil {
+		msg = perm.Err.Error()
+	}
+	return strings.Contains(msg, "Product item rate with name already exists") ||
+		strings.Contains(msg, "Property productItemPriceName")
+}
+
+func isProductItemSameMeterError(err error) bool {
+	var perm *PermanentError
+	if !errors.As(err, &perm) {
+		return false
+	}
+	msg := perm.ResponseBody
+	if msg == "" && perm.Err != nil {
+		msg = perm.Err.Error()
+	}
+	return strings.Contains(msg, "have the same meter")
+}
+
+func productItemPriceNameAcceptable(existing, want, priceID string) bool {
+	return existing == want || existing == disambiguatedMeterLabel(want, priceID)
 }
 
 func (c *client) putProductPlan(ctx context.Context, method string, wp wireProductPlan) (ProductPlan, error) {
@@ -612,11 +737,11 @@ func buildPlanGenerator(
 	}
 }
 
-func priceGeneratorFromMachine(priceID string, item *DesiredPlanItem, price any) (wirePriceGenerator, error) {
+func priceGeneratorFromMachine(priceID string, item *DesiredPlanItem, price any, productItemID string) (wirePriceGenerator, error) {
 	gen := wirePriceGenerator{
 		ID:                   priceID,
-		ProductItemID:        item.MeterAPIName,
-		ProductItemPriceName: firstNonEmpty(item.Label, item.ID),
+		ProductItemID:        productItemID,
+		ProductItemPriceName: disambiguatedMeterLabel(firstNonEmpty(item.Label, item.ID), priceID),
 		LockingStatus:        lockingStatusClose,
 		Scalar:               1,
 	}

@@ -225,11 +225,15 @@ func (f *recordingFakeServer) serve(w http.ResponseWriter, r *http.Request) {
 
 	case r.Method == http.MethodGet && r.URL.Path == "/meters":
 		// List-with-filter — matches the live API. Empty result => [].
-		filter := r.URL.Query().Get("meterApiName")
+		apiNameFilter := r.URL.Query().Get("meterApiName")
+		labelFilter := r.URL.Query().Get("label")
 		f.mu.Lock()
 		out := make([]storedMeter, 0, len(f.meters))
 		for _, m := range f.meters {
-			if filter != "" && m.MeterAPIName != filter {
+			if apiNameFilter != "" && m.MeterAPIName != apiNameFilter {
+				continue
+			}
+			if labelFilter != "" && m.Label != labelFilter {
 				continue
 			}
 			cp := *m
@@ -257,6 +261,15 @@ func (f *recordingFakeServer) serve(w http.ResponseWriter, r *http.Request) {
 			f.mu.Unlock()
 			http.Error(w, `{"errorMessage":"Invalid request: Meter already exists"}`, http.StatusBadRequest)
 			return
+		}
+		for _, m := range f.meters {
+			if in.Label != "" && m.Label == in.Label {
+				f.mu.Unlock()
+				http.Error(w,
+					`{"errorMessage":"Invalid request: Meter already exists with 'label': `+in.Label+`"}`,
+					http.StatusBadRequest)
+				return
+			}
 		}
 		locking := in.LockingStatus
 		if locking == "" {
@@ -289,11 +302,24 @@ func (f *recordingFakeServer) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		f.mu.Lock()
-		existing, ok := f.meters[in.MeterAPIName]
-		if !ok {
-			f.mu.Unlock()
-			http.Error(w, "not found", http.StatusNotFound)
-			return
+		var existing *storedMeter
+		var oldKey string
+		for key, m := range f.meters {
+			if in.ID != "" && m.ID == in.ID {
+				existing = m
+				oldKey = key
+				break
+			}
+		}
+		if existing == nil {
+			var ok bool
+			existing, ok = f.meters[in.MeterAPIName]
+			if !ok {
+				f.mu.Unlock()
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			oldKey = in.MeterAPIName
 		}
 		if in.ID == "" || in.ID != existing.ID {
 			f.mu.Unlock()
@@ -310,6 +336,13 @@ func (f *recordingFakeServer) serve(w http.ResponseWriter, r *http.Request) {
 				http.StatusBadRequest)
 			return
 		}
+		if in.MeterAPIName != existing.MeterAPIName && existing.LockingStatus != "open" {
+			f.mu.Unlock()
+			http.Error(w,
+				`{"errorMessage":"Invalid request: meterApiName cannot be changed while lockingStatus is `+existing.LockingStatus+`"}`,
+				http.StatusBadRequest)
+			return
+		}
 		existing.Label = in.Label
 		existing.MeterType = in.MeterType
 		existing.Unit = in.Unit
@@ -318,6 +351,11 @@ func (f *recordingFakeServer) serve(w http.ResponseWriter, r *http.Request) {
 		existing.UseInBilling = in.UseInBilling
 		if in.LockingStatus != "" {
 			existing.LockingStatus = in.LockingStatus
+		}
+		if in.MeterAPIName != oldKey {
+			delete(f.meters, oldKey)
+			existing.MeterAPIName = in.MeterAPIName
+			f.meters[in.MeterAPIName] = existing
 		}
 		out := *existing
 		f.mu.Unlock()
